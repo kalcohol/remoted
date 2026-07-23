@@ -90,6 +90,10 @@ LRESULT CALLBACK Tray::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     }
 
     switch (msg) {
+    case WM_APP_BALLOON:
+        if (ov) self->show_balloon(L"remoted already running",
+                                   L"ssh session is up - see the tray icon.");
+        return 0;
     case WM_APP_STATE: {
         int active = (int)wp;
         if (app && app->cfg.overlay.enabled && ov) {
