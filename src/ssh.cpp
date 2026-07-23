@@ -340,6 +340,7 @@ static void bind_serial(App* app, std::string host, SerialCfg sc, std::string ho
 }
 
 void ssh_start(App* app) {
+    ssh_init();
     ensure_host_key(app->cfg.host_key);
     std::string host = app->cfg.listen_host;
     std::string hk = app->cfg.host_key;

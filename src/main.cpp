@@ -20,6 +20,14 @@ static std::string abs_path(const std::wstring& exe_dir, const std::string& p) {
 }
 
 int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
+    // single-instance: refuse to start a second copy
+    HANDLE single = CreateMutexW(nullptr, TRUE, L"Local\\remoted-singleton-v1");
+    if (GetLastError() == ERROR_ALREADY_EXISTS) {
+        MessageBoxW(nullptr, L"remoted is already running (check the system tray / overflow area).",
+                    L"remoted", MB_ICONINFORMATION);
+        return 0;
+    }
+
     wchar_t exe[MAX_PATH];
     GetModuleFileNameW(nullptr, exe, MAX_PATH);
     std::wstring exe_path(exe);
@@ -56,6 +64,12 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
     }
 
     ssh_start(&app);
+
+    {
+        std::wstring body = L"ssh :" + std::to_wstring(app.cfg.listen_port) +
+                            L" ready. (if no tray icon, check the overflow / hidden-icons area)";
+        tray.show_balloon(L"remoted running", body);
+    }
 
     int ret = tray.loop();
     LOG("remoted exiting (code %d)", ret);

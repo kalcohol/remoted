@@ -42,11 +42,22 @@ bool Tray::create(App* app, Overlay* overlay, HINSTANCE hi) {
     nid_.uCallbackMessage = WM_APP_TRAY;
     nid_.hIcon            = load_icon();
     wcscpy_s(nid_.szTip, L"remoted");
-    Shell_NotifyIconW(NIM_ADD, &nid_);
+    BOOL icn = Shell_NotifyIconW(NIM_ADD, &nid_);
+    LOG("tray icon NIM_ADD: %s (hIcon=%p hwnd=%p cbSize=%u)",
+        icn ? "ok" : "FAIL", nid_.hIcon, hwnd_, (unsigned)nid_.cbSize);
 
     app_->hwnd_main = hwnd_;
     LOG("tray ready");
     return true;
+}
+
+void Tray::show_balloon(const std::wstring& title, const std::wstring& body) {
+    nid_.uFlags |= NIF_INFO;
+    nid_.dwInfoFlags = NIIF_INFO;
+    wcsncpy_s(nid_.szInfoTitle, title.c_str(), _TRUNCATE);
+    wcsncpy_s(nid_.szInfo, body.c_str(), _TRUNCATE);
+    nid_.uTimeout = 10000;
+    Shell_NotifyIconW(NIM_MODIFY, &nid_);
 }
 
 int Tray::loop() {
