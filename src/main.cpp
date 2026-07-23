@@ -86,9 +86,24 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
     app.cfg = load_config(cfg_path);
     LOG("step: config loaded");
 
+    // authorized_keys: prefer the standard %USERPROFILE%\.ssh\authorized_keys
+    // if it exists and the user did not point the config elsewhere.
+    if (app.cfg.authorized_keys == "keys/authorized_keys") {
+        wchar_t profile[MAX_PATH];
+        DWORD nn = GetEnvironmentVariableW(L"USERPROFILE", profile, MAX_PATH);
+        if (nn > 0 && nn < MAX_PATH) {
+            std::wstring u = std::wstring(profile) + L"\\.ssh\\authorized_keys";
+            if (GetFileAttributesW(u.c_str()) != INVALID_FILE_ATTRIBUTES) {
+                app.cfg.authorized_keys = wide_to_utf8(u);
+                LOG("authorized_keys: using %USERPROFILE%\\.ssh\\authorized_keys");
+            }
+        }
+    }
+
     app.cfg.host_key        = abs_path(exe_dir, app.cfg.host_key);
     app.cfg.authorized_keys = abs_path(exe_dir, app.cfg.authorized_keys);
     app.cfg.shell_dir       = abs_path(exe_dir, app.cfg.shell_dir);
+    LOG("authorized_keys resolved: %s", app.cfg.authorized_keys.c_str());
 
     LOG("step: ensuring keys dir");
     auto kp = app.cfg.host_key.find_last_of("/\\");

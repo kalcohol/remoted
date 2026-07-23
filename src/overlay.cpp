@@ -17,7 +17,7 @@ static LRESULT CALLBACK OverlayProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         return (LRESULT)GetStockObject(BLACK_BRUSH);
     }
     case WM_COMMAND:
-        if (LOWORD(wp) == IDC_DISC) { ssh_disconnect_all(); }
+        if (LOWORD(wp) == IDC_DISC) { LOG("disconnect-all requested via overlay button"); ssh_disconnect_all(); }
         else if (LOWORD(wp) == IDC_MIN) { ShowWindow(h, SW_HIDE); }
         return 0;
     case WM_ERASEBKGND: {
