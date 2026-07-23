@@ -55,22 +55,18 @@ void App::session_end(int token) {
     if (hwnd_main) PostMessage(hwnd_main, WM_APP_STATE, zero ? 0 : 1, 0);
 }
 
-bool App::mark_busy(const std::string& name, const std::string& holder) {
+bool App::mark_busy(const std::string& name, int token, const std::string& holder) {
     std::lock_guard<std::mutex> lk(m_);
     for (auto& st : status_) {
-        if (st.name == name) { st.holders.push_back(holder); return true; }
+        if (st.name == name) { st.holders[token] = holder; return true; }
     }
     return false;
 }
 
-void App::clear_busy(const std::string& name, const std::string& holder) {
+void App::clear_busy(const std::string& name, int token) {
     std::lock_guard<std::mutex> lk(m_);
     for (auto& st : status_) {
-        if (st.name == name) {
-            st.holders.erase(std::remove(st.holders.begin(), st.holders.end(), holder),
-                             st.holders.end());
-            break;
-        }
+        if (st.name == name) { st.holders.erase(token); break; }
     }
 }
 

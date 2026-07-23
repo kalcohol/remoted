@@ -10,6 +10,7 @@ find_package(nlohmann_json CONFIG REQUIRED)
 add_executable(remoted WIN32
   src/main.cpp
   src/log.cpp
+  src/codepage.cpp
   src/config.cpp
   src/pnp.cpp
   src/serial.cpp

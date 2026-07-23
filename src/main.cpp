@@ -3,6 +3,7 @@
 #include "overlay.h"
 #include "tray.h"
 #include "ssh.h"
+#include "codepage.h"
 #include "log.h"
 #include "util.h"
 
@@ -127,6 +128,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
     }
 
     LOG("step: starting ssh");
+    cp_init();
     ssh_start(&app);
 
     {

@@ -139,7 +139,8 @@ LRESULT CALLBACK Tray::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                 else if (s.holders.empty()) os << "[ready]";
                 else {
                     os << "[in-use: ";
-                    for (size_t i = 0; i < s.holders.size(); ++i) { if (i) os << ", "; os << s.holders[i]; }
+                    bool first = true;
+                    for (const auto& hp : s.holders) { if (!first) os << ", "; os << hp.second; first = false; }
                     os << "]";
                 }
                 os << "\n";
@@ -162,6 +163,8 @@ LRESULT CALLBACK Tray::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         }
         case IDM_EXIT:
             Shell_NotifyIconW(NIM_DELETE, &self->nid_);
+            ssh_request_shutdown();   // stop accept loops + drop sessions cleanly
+            Sleep(150);
             PostQuitMessage(0);
             break;
         }

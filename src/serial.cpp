@@ -19,7 +19,15 @@ bool SerialPort::open(const std::string& com, uint32_t baud) {
         dcb.BaudRate = baud;
         dcb.ByteSize = 8; dcb.Parity = NOPARITY; dcb.StopBits = ONESTOPBIT;
         dcb.fBinary = TRUE; dcb.fParity = FALSE;
-        SetCommState(h_, &dcb);
+        // no flow control; drive DTR/RTS so USB-serial / MAX3232 powered off
+        // these lines actually transceive; keep null bytes (binary-safe).
+        dcb.fOutxCtsFlow = FALSE; dcb.fOutxDsrFlow = FALSE;
+        dcb.fOutX = FALSE; dcb.fInX = FALSE;
+        dcb.fDtrControl = DTR_CONTROL_ENABLE;
+        dcb.fRtsControl = RTS_CONTROL_ENABLE;
+        dcb.fNull = FALSE;
+        if (!SetCommState(h_, &dcb))
+            LOG("serial SetCommState failed %s err=%lu", com.c_str(), GetLastError());
     }
     COMMTIMEOUTS to{};   // all zero: overlapped reads pend until data arrives
     SetCommTimeouts(h_, &to);
@@ -44,7 +52,7 @@ int SerialPort::read(void* buf, int len, DWORD timeout_ms) {
         if (e == ERROR_IO_PENDING) {
             DWORD r = WaitForSingleObject(ev, timeout_ms);
             if (r == WAIT_OBJECT_0) { GetOverlappedResult(h_, &ov, &got, FALSE); ret = (int)got; }
-            else { CancelIo(h_); ret = 0; }
+            else { CancelIo(h_); GetOverlappedResult(h_, &ov, &got, TRUE); ret = 0; }  // reap the canceled IRP
         } else ret = -1;
     } else ret = (int)got;
     CloseHandle(ev);
@@ -60,8 +68,12 @@ int SerialPort::write(const void* buf, int len) {
     int ret;
     if (!ok) {
         DWORD e = GetLastError();
-        if (e == ERROR_IO_PENDING) { WaitForSingleObject(ev, 2000); GetOverlappedResult(h_, &ov, &wrote, FALSE); ret = (int)wrote; }
-        else ret = -1;
+        if (e == ERROR_IO_PENDING) {
+            DWORD r = WaitForSingleObject(ev, 2000);
+            if (r == WAIT_OBJECT_0) { GetOverlappedResult(h_, &ov, &wrote, FALSE); }
+            else { CancelIo(h_); GetOverlappedResult(h_, &ov, &wrote, TRUE); LOG("serial write timeout (%d bytes)", len); }
+            ret = (int)wrote;
+        } else ret = -1;
     } else ret = (int)wrote;
     CloseHandle(ev);
     return ret;

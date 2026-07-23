@@ -3,12 +3,14 @@
 #include "serial.h"
 #include "pnp.h"
 #include "util.h"
+#include "codepage.h"
 #include "log.h"
 
 #include <libssh/libssh.h>
 #include <libssh/server.h>
 
 #include <windows.h>
+#include <jobapi.h>
 #include <thread>
 #include <atomic>
 #include <vector>
@@ -46,6 +48,11 @@ void ssh_disconnect_all() {
     for (auto& a : copy) a->store(true);
 }
 
+void ssh_request_shutdown() {
+    g_stop = true;
+    ssh_disconnect_all();
+}
+
 // ---- host key ----
 static void ensure_host_key(const std::string& path) {
     ssh_key k = nullptr;
@@ -69,19 +76,28 @@ static std::vector<AuthKey> load_auth_keys(const std::string& path) {
     std::vector<AuthKey> keys;
     std::ifstream f(path);
     if (!f) { LOG("authorized_keys not found: %s", path.c_str()); return keys; }
+    auto is_keytype = [](const std::string& s) {
+        return s.rfind("ssh-", 0) == 0 || s.rfind("ecdsa-", 0) == 0 ||
+               s.rfind("sk-", 0) == 0;
+    };
     std::string line;
     while (std::getline(f, line)) {
         if (line.empty() || line[0] == '#') continue;
-        std::istringstream is(line);
-        std::string type, b64, comment;
-        is >> type >> b64;
-        std::getline(is, comment);
-        auto p = comment.find_first_not_of(" \t");
-        comment = (p != std::string::npos) ? comment.substr(p) : "";
-        if (type.empty() || b64.empty()) continue;
-        ssh_keytypes_e t = ssh_key_type_from_name(type.c_str());
+        // tokenize, skipping a leading options field (e.g. "no-pty ssh-ed25519 ...")
+        std::vector<std::string> t;
+        { std::istringstream is(line); std::string w; while (is >> w) t.push_back(w); }
+        size_t ki = t.size();
+        for (size_t i = 0; i < t.size(); ++i) if (is_keytype(t[i])) { ki = i; break; }
+        if (ki == t.size() || ki + 1 >= t.size()) continue;   // no type + base64
+        const std::string& type = t[ki];
+        const std::string& b64 = t[ki + 1];
+        std::string comment;
+        for (size_t i = ki + 2; i < t.size(); ++i) { if (!comment.empty()) comment += " "; comment += t[i]; }
+        while (!comment.empty() && (comment.back() == '\r' || comment.back() == '\n')) comment.pop_back();
+
+        ssh_keytypes_e ty = ssh_key_type_from_name(type.c_str());
         ssh_key k = nullptr;
-        if (ssh_pki_import_pubkey_base64(b64.c_str(), t, &k) == SSH_OK)
+        if (ssh_pki_import_pubkey_base64(b64.c_str(), ty, &k) == SSH_OK)
             keys.push_back({ k, comment });
     }
     LOG("loaded %d authorized keys", (int)keys.size());
@@ -188,18 +204,23 @@ static void send_motd(ssh_channel ch, App& app) {
         std::string state;
         if (!st.present) state = "[absent]";
         else if (st.holders.empty()) state = "[ready]";
-        else { state = "[in-use: "; for (size_t i=0;i<st.holders.size();++i){ if(i) state+=", "; state+=st.holders[i]; } state+="]"; }
+        else {
+            state = "[in-use: "; bool first = true;
+            for (const auto& hp : st.holders) { if (!first) state += ", "; state += hp.second; first = false; }
+            state += "]";
+        }
         m += "  " + st.name + "  " + st.com + "  :" + std::to_string(st.listen_port) + "  " + state + "\r\n";
     }
     m += "================\r\n\r\n";
     ssh_channel_write(ch, m.data(), (uint32_t)m.size());
 }
 
-// ---- child process pump (pipes) ----
-// exec: cmd /C <cmd>. interactive shell: cmd /K, where we provide local echo and
-// translate \r -> \r\n (cmd over a pipe neither echoes nor treats lone \r as Enter).
-// IMPORTANT: all ssh_channel_* calls happen on this (main) thread only. The reader
-// thread just pushes child stdout into a queue -> no concurrent channel access.
+// ---- child process pump (pipes + OEM<->UTF-8 transcoding) ----
+// exec: cmd /C <cmd>. interactive shell: cmd /K with local echo + \r->\r\n.
+// All ssh_channel_* calls are on this thread only; the reader pushes child
+// output (already converted to UTF-8) into a queue. The child runs in a job
+// object so we can kill the whole tree -> the stdout pipe always EOFs and the
+// reader can never block join forever (e.g. cmd spawns a background process).
 static void run_shell(ssh_channel ch, const AppConfig& cfg, bool exec, const std::string& exec_cmd,
                       const std::shared_ptr<std::atomic<bool>>& abort) {
     std::wstring cmdline = exec ? (L"cmd.exe /C " + utf8_to_wide(exec_cmd)) : L"cmd.exe /K";
@@ -228,18 +249,20 @@ static void run_shell(ssh_channel ch, const AppConfig& cfg, bool exec, const std
         return;
     }
 
-    // reader: child stdout -> queue (never touches the channel)
+    // reader: child stdout (OEM) -> UTF-8 -> queue (never touches the channel)
     struct Q { std::mutex m; std::deque<std::string> q; bool eof = false; };
     auto Q_ = std::make_shared<Q>();
-    std::thread reader([cOutR, Q_]() {
+    auto oemCarry = std::make_shared<std::string>();
+    std::thread reader([cOutR, Q_, oemCarry]() {
         char b[4096]; DWORD n;
         while (ReadFile(cOutR, b, sizeof b, &n, nullptr) && n > 0) {
-            std::lock_guard<std::mutex> lk(Q_->m);
-            Q_->q.emplace_back(b, n);
+            std::string s = cp_oem2utf8(b, n, *oemCarry);
+            if (!s.empty()) { std::lock_guard<std::mutex> lk(Q_->m); Q_->q.push_back(s); }
         }
         std::lock_guard<std::mutex> lk(Q_->m);
         Q_->eof = true;
-        CloseHandle(cOutR);
+        // note: cOutR is closed by the caller after join (closing it here would
+        // race with the caller's "close to unblock" on shutdown).
     });
 
     auto drain = [&]() {
@@ -252,39 +275,50 @@ static void run_shell(ssh_channel ch, const AppConfig& cfg, bool exec, const std
     };
 
     char buf[4096];
+    std::string u2oCarry;
+    bool stdinClosed = false, childDone = false;
     while (true) {
         if (abort->load()) break;
-        drain();   // child output -> channel
+        drain();
 
-        int avail = ssh_channel_poll_timeout(ch, 50, 0);   // wait up to 50ms for input
+        // client closed its stdin -> propagate EOF to the child (once)
+        if (!stdinClosed && ssh_channel_is_eof(ch)) {
+            CloseHandle(cInW); cInW = INVALID_HANDLE_VALUE; stdinClosed = true;
+        }
+
+        int avail = ssh_channel_poll_timeout(ch, 50, 0);
         if (avail > 0) {
             int rd = (avail < (int)sizeof buf) ? avail : (int)sizeof buf;
             int r = ssh_channel_read(ch, buf, (uint32_t)rd, 0);
             if (r > 0) {
                 if (exec) {
-                    DWORD w = 0; WriteFile(cInW, buf, (DWORD)r, &w, nullptr);
+                    DWORD w = 0; if (cInW != INVALID_HANDLE_VALUE) WriteFile(cInW, buf, (DWORD)r, &w, nullptr);
                 } else {
-                    ssh_channel_write(ch, buf, (uint32_t)r);                       // local echo
-                    std::string out; out.reserve(r + 8);
-                    for (int i = 0; i < r; ++i) out += (buf[i] == '\r') ? std::string("\r\n") : std::string(1, buf[i]);
-                    DWORD w = 0; WriteFile(cInW, out.data(), (DWORD)out.size(), &w, nullptr);
+                    ssh_channel_write(ch, buf, (uint32_t)r);                       // local echo (raw UTF-8)
+                    std::string exp; exp.reserve(r + 8);
+                    for (int i = 0; i < r; ++i) exp += (buf[i] == '\r') ? std::string("\r\n") : std::string(1, buf[i]);
+                    std::string oem = cp_utf82oem(exp.data(), exp.size(), u2oCarry);
+                    if (!oem.empty() && cInW != INVALID_HANDLE_VALUE) {
+                        DWORD w = 0; WriteFile(cInW, oem.data(), (DWORD)oem.size(), &w, nullptr);
+                    }
                 }
             }
         }
-        // note: do NOT break on avail<=0 - for exec the client EOFs its stdin right
-        // after the request; we must keep draining cmd output until cmd exits.
 
-        bool childDone;
         { std::lock_guard<std::mutex> lk(Q_->m); childDone = Q_->eof; }
-        if (childDone) { drain(); ssh_channel_send_eof(ch); break; }
+        if (childDone) { drain(); break; }
         if (ssh_channel_is_closed(ch)) break;
     }
 
-    CloseHandle(cInW);
-    if (abort->load()) TerminateProcess(pi.hProcess, 1);
+    if (cInW != INVALID_HANDLE_VALUE) { CloseHandle(cInW); cInW = INVALID_HANDLE_VALUE; }
+    if (abort->load() || !childDone) TerminateProcess(pi.hProcess, 1);
     WaitForSingleObject(pi.hProcess, 3000);
+    DWORD code = 1;
+    GetExitCodeProcess(pi.hProcess, &code);
+    ssh_channel_request_send_exit_status(ch, (int)code);
+    CloseHandle(cOutR);   // unblocks a still-blocked reader (e.g. a grandchild holds the write end)
     reader.join();
-    CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
+    CloseHandle(pi.hProcess);
 }
 
 // ---- shared serial bridge ----
@@ -384,7 +418,7 @@ static void shell_session(ssh_session s, App* app) {
     ssh_channel ch = accept_channel(s);
     if (!ch) { unreg_abort(abort); app->session_end(tok); return; }
     ChanReq rq = wait_channel_requests(s);
-    send_motd(ch, *app);
+    if (!rq.exec) send_motd(ch, *app);   // banner only for interactive shells, not exec
     run_shell(ch, app->cfg, rq.exec, rq.exec_cmd, abort);
     ssh_channel_send_eof(ch); ssh_channel_close(ch); ssh_channel_free(ch);
     unreg_abort(abort);
@@ -400,10 +434,10 @@ static void serial_session(ssh_session s, const SerialCfg sc, App* app) {
     LOG("serial session %s auth ok: %s", sc.name.c_str(), who.c_str());
     int tok = app->session_start(sc.name, who);
     auto abort = reg_abort();
-    app->mark_busy(sc.name, who);
+    app->mark_busy(sc.name, tok, who);
 
     ssh_channel ch = accept_channel(s);
-    if (!ch) { app->clear_busy(sc.name, who); unreg_abort(abort); app->session_end(tok); return; }
+    if (!ch) { app->clear_busy(sc.name, tok); unreg_abort(abort); app->session_end(tok); return; }
     wait_channel_requests(s);
 
     std::string com = app->find_com_for(sc.name);
@@ -444,7 +478,7 @@ static void serial_session(ssh_session s, const SerialCfg sc, App* app) {
     }
 
     ssh_channel_send_eof(ch); ssh_channel_close(ch); ssh_channel_free(ch);
-    app->clear_busy(sc.name, who);
+    app->clear_busy(sc.name, tok);
     unreg_abort(abort);
     app->session_end(tok);
 }

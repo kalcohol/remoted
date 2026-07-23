@@ -7,6 +7,7 @@
 #include <vector>
 #include <string>
 #include <unordered_map>
+#include <map>
 
 #define WM_APP_STATE   (WM_APP + 1)   // occupancy changed -> refresh overlay
 #define WM_APP_TRAY    (WM_APP + 2)   // tray icon callback
@@ -19,7 +20,7 @@ struct SerialStatus {
     std::string com;
     uint16_t    listen_port = 0;
     bool        present = false;
-    std::vector<std::string> holders;   // display names currently attached
+    std::map<int,std::string> holders;   // session token -> display name
 };
 
 class Overlay;
@@ -42,9 +43,10 @@ public:
     void session_end(int token);
     std::vector<std::string> shell_holders() const;
 
-    // serial hold registry (status only; sharing is handled by the ssh layer)
-    bool mark_busy(const std::string& name, const std::string& holder);
-    void clear_busy(const std::string& name, const std::string& holder);
+    // serial hold registry (status only; sharing is handled by the ssh layer).
+    // keyed by session token so two sessions of the same name don't clobber each other.
+    bool mark_busy(const std::string& name, int token, const std::string& holder);
+    void clear_busy(const std::string& name, int token);
 
     const Identity* identity_for(const std::string& fp) const;
 
