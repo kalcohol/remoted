@@ -57,19 +57,19 @@ void App::session_end(int token) {
 bool App::mark_busy(const std::string& name, const std::string& holder) {
     std::lock_guard<std::mutex> lk(m_);
     for (auto& st : status_) {
-        if (st.name == name) {
-            if (st.busy) return false;
-            st.busy = true; st.holder = holder;
-            return true;
-        }
+        if (st.name == name) { st.holders.push_back(holder); return true; }
     }
     return false;
 }
 
-void App::clear_busy(const std::string& name) {
+void App::clear_busy(const std::string& name, const std::string& holder) {
     std::lock_guard<std::mutex> lk(m_);
     for (auto& st : status_) {
-        if (st.name == name) { st.busy = false; st.holder.clear(); break; }
+        if (st.name == name) {
+            st.holders.erase(std::remove(st.holders.begin(), st.holders.end(), holder),
+                             st.holders.end());
+            break;
+        }
     }
 }
 

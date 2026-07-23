@@ -19,8 +19,7 @@ struct SerialStatus {
     std::string com;
     uint16_t    listen_port = 0;
     bool        present = false;
-    bool        busy = false;
-    std::string holder;
+    std::vector<std::string> holders;   // display names currently attached
 };
 
 class Overlay;
@@ -41,9 +40,9 @@ public:
     int  session_start(const std::string& display_name);
     void session_end(int token);
 
-    // serial exclusive-hold registry (status only; OS enforces exclusivity)
+    // serial hold registry (status only; sharing is handled by the ssh layer)
     bool mark_busy(const std::string& name, const std::string& holder);
-    void clear_busy(const std::string& name);
+    void clear_busy(const std::string& name, const std::string& holder);
 
     const Identity* identity_for(const std::string& fp) const;
 

@@ -17,6 +17,9 @@
 #include <fstream>
 #include <sstream>
 #include <algorithm>
+#include <map>
+#include <deque>
+#include <memory>
 
 // ---- session registry (for disconnect-all) ----
 static std::mutex g_sess_m;
@@ -176,7 +179,10 @@ static ChanReq wait_channel_requests(ssh_session s) {
 static void send_motd(ssh_channel ch, App& app) {
     std::string m = "\r\n=== remoted ===\r\nSerial consoles (ssh alias / ssh -p <port>):\r\n";
     for (auto& st : app.snapshot()) {
-        const char* state = st.busy ? "[in-use]" : (st.present ? "[ready]" : "[absent]");
+        std::string state;
+        if (!st.present) state = "[absent]";
+        else if (st.holders.empty()) state = "[ready]";
+        else { state = "[in-use: "; for (size_t i=0;i<st.holders.size();++i){ if(i) state+=", "; state+=st.holders[i]; } state+="]"; }
         m += "  " + st.name + "  " + st.com + "  :" + std::to_string(st.listen_port) + "  " + state + "\r\n";
     }
     m += "================\r\n\r\n";
@@ -252,6 +258,93 @@ static void shell_session(ssh_session s, App* app) {
     app->session_end(tok);
 }
 
+// ---- shared serial bridge ----
+// One COM port is opened once; multiple viewers can attach. The reader thread
+// fans UART output into each viewer's queue; each session thread drains its own
+// queue and polls its own channel, so channel I/O stays single-threaded per session.
+struct Attach {
+    ssh_channel ch;
+    std::mutex qm;
+    std::deque<std::string> outq;
+};
+
+struct SerialBridge : std::enable_shared_from_this<SerialBridge> {
+    std::string name, com; uint32_t baud = 0;
+    SerialPort sp;
+    std::atomic<bool> stop{ false };
+    std::thread reader;
+    std::mutex att_m;
+    std::vector<std::shared_ptr<Attach>> attaches;
+    std::mutex write_m;
+    std::atomic<int> ref{ 0 };
+
+    void start_reader() {
+        auto self = shared_from_this();
+        reader = std::thread([self]() {
+            char b[4096]; int n;
+            while (!self->stop) {
+                n = self->sp.read(b, sizeof b, 100);
+                if (n > 0) {
+                    std::lock_guard<std::mutex> lk(self->att_m);
+                    std::string chunk(b, n);
+                    for (auto& a : self->attaches) {
+                        std::lock_guard<std::mutex> ql(a->qm);
+                        a->outq.push_back(chunk);
+                    }
+                } else if (n < 0) break;
+            }
+        });
+    }
+    std::shared_ptr<Attach> attach(ssh_channel ch) {
+        auto a = std::make_shared<Attach>(); a->ch = ch;
+        std::lock_guard<std::mutex> lk(att_m); attaches.push_back(a);
+        return a;
+    }
+    void detach(const std::shared_ptr<Attach>& a) {
+        std::lock_guard<std::mutex> lk(att_m);
+        attaches.erase(std::remove(attaches.begin(), attaches.end(), a), attaches.end());
+    }
+    void write_com(const void* buf, int len) {
+        std::lock_guard<std::mutex> lk(write_m);
+        sp.write(buf, len);
+    }
+};
+
+static std::mutex g_bm;
+static std::map<std::string, std::shared_ptr<SerialBridge>> g_bridges;
+
+static std::shared_ptr<SerialBridge> bridge_attach(const SerialCfg& sc, const std::string& com) {
+    std::lock_guard<std::mutex> lk(g_bm);
+    auto it = g_bridges.find(sc.name);
+    if (it != g_bridges.end()) { it->second->ref++; return it->second; }
+    auto b = std::make_shared<SerialBridge>();
+    b->name = sc.name; b->com = com; b->baud = sc.baud;
+    if (!b->sp.open(com, sc.baud)) { LOG("bridge open failed %s (%s)", sc.name.c_str(), com.c_str()); return nullptr; }
+    LOG("bridge opened %s (%s) @%u", sc.name.c_str(), com.c_str(), sc.baud);
+    g_bridges[sc.name] = b;
+    b->ref++;
+    b->start_reader();
+    return b;
+}
+
+static void bridge_release(const std::string& name, const std::shared_ptr<Attach>& a) {
+    std::shared_ptr<SerialBridge> b; bool last = false;
+    {
+        std::lock_guard<std::mutex> lk(g_bm);
+        auto it = g_bridges.find(name);
+        if (it == g_bridges.end()) return;
+        b = it->second;
+        if (--b->ref == 0) { g_bridges.erase(it); last = true; }
+    }
+    if (b) b->detach(a);
+    if (last) {
+        b->stop = true;
+        if (b->reader.joinable()) b->reader.join();
+        b->sp.close();
+        LOG("bridge closed %s", name.c_str());
+    }
+}
+
 static void serial_session(ssh_session s, const SerialCfg sc, App* app) {
     auto keys = load_auth_keys(app->cfg.authorized_keys);
     Auth a = authenticate(s, keys);
@@ -260,49 +353,50 @@ static void serial_session(ssh_session s, const SerialCfg sc, App* app) {
     std::string who = display_name(app, a);
     LOG("serial session %s auth ok: %s", sc.name.c_str(), who.c_str());
     int tok = app->session_start(who);
+    app->mark_busy(sc.name, who);
 
     ssh_channel ch = accept_channel(s);
-    if (!ch) { app->session_end(tok); return; }
+    if (!ch) { app->clear_busy(sc.name, who); app->session_end(tok); return; }
     wait_channel_requests(s);   // accept pty/shell (client uses `ssh -t`)
 
     std::string com = app->find_com_for(sc.name);
-
     if (com.empty()) {
-        const char* m = "remoted: serial port not present\r\n";
-        ssh_channel_write(ch, m, (uint32_t)strlen(m));
-    } else if (!app->mark_busy(sc.name, sc.name + " - " + who)) {
-        const char* m = "remoted: serial in use, try later\r\n";
+        const char* m = "remoted: serial port not present on this host\r\n";
         ssh_channel_write(ch, m, (uint32_t)strlen(m));
     } else {
-        SerialPort sp;
-        if (!sp.open(com, sc.baud)) {
+        auto b = bridge_attach(sc, com);
+        if (!b) {
             const char* m = "remoted: cannot open serial port\r\n";
             ssh_channel_write(ch, m, (uint32_t)strlen(m));
-            app->clear_busy(sc.name);
         } else {
-            std::atomic<bool> stop{ false };
-            std::thread reader([&sp, ch, &stop]() {
-                char b[4096]; int n;
-                while (!stop && sp.ok()) {
-                    n = sp.read(b, sizeof b, 100);
-                    if (n > 0) ssh_channel_write(ch, b, (uint32_t)n);
-                    else if (n < 0) break;
+            auto at = b->attach(ch);
+            char buf[4096];
+            while (true) {
+                int avail = ssh_channel_poll(ch, 0);
+                if (avail < 0) break;
+                if (avail > 0) {
+                    int rd = (avail < (int)sizeof buf) ? avail : (int)sizeof buf;
+                    int r = ssh_channel_read(ch, buf, (uint32_t)rd, 0);
+                    if (r > 0) b->write_com(buf, r);
+                    else if (r < 0) break;
                 }
-            });
-            char b[4096];
-            while (sp.ok()) {
-                int r = ssh_channel_read(ch, b, sizeof b, 0);
-                if (r < 0) break;
-                if (r > 0 && sp.write(b, r) < 0) break;
+                {
+                    std::lock_guard<std::mutex> ql(at->qm);
+                    while (!at->outq.empty()) {
+                        const auto& ss = at->outq.front();
+                        ssh_channel_write(ch, ss.data(), (uint32_t)ss.size());
+                        at->outq.pop_front();
+                    }
+                }
                 if (ssh_channel_is_eof(ch)) break;
+                if (avail == 0) Sleep(5);
             }
-            stop = true; reader.join();
-            sp.close();
-            app->clear_busy(sc.name);
+            bridge_release(sc.name, at);
         }
     }
 
     ssh_channel_send_eof(ch); ssh_channel_close(ch); ssh_channel_free(ch);
+    app->clear_busy(sc.name, who);
     app->session_end(tok);
 }
 

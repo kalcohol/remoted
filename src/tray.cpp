@@ -133,15 +133,23 @@ LRESULT CALLBACK Tray::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             std::ostringstream os;
             auto snap = app->snapshot();
             os << "remoted status\n\n";
-            for (auto& s : snap)
-                os << "  " << s.name << "  " << s.com << "  :" << s.listen_port
-                   << "  " << (s.busy ? ("[in-use " + s.holder + "]")
-                                       : (s.present ? "[ready]" : "[absent]")) << "\n";
+            for (auto& s : snap) {
+                os << "  " << s.name << "  " << s.com << "  :" << s.listen_port << "  ";
+                if (!s.present) os << "[absent]";
+                else if (s.holders.empty()) os << "[ready]";
+                else {
+                    os << "[in-use: ";
+                    for (size_t i = 0; i < s.holders.size(); ++i) { if (i) os << ", "; os << s.holders[i]; }
+                    os << "]";
+                }
+                os << "\n";
+            }
             std::wstring ws = utf8_to_wide(os.str());
             MessageBoxW(h, ws.c_str(), L"remoted", MB_OK | MB_ICONINFORMATION);
             break;
         }
         case IDM_DISC:
+            LOG("disconnect-all requested via tray menu");
             ssh_disconnect_all();
             break;
         case IDM_SHOW:
