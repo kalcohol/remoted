@@ -34,12 +34,10 @@ std::string App::find_com_for(const std::string& name) const {
     return "";
 }
 
-int App::session_start(const std::string& fp) {
-    const Identity* id = identity_for(fp);
-    std::string who = id ? id->name : (fp.empty() ? std::string("(unknown)") : fp);
+int App::session_start(const std::string& display_name) {
     std::lock_guard<std::mutex> lk(m_);
     int t = next_token_++;
-    holders_[t] = who;
+    holders_[t] = display_name;
     active_++;
     if (hwnd_main) PostMessage(hwnd_main, WM_APP_STATE, 1, 0);
     return t;

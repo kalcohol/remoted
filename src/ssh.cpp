@@ -56,25 +56,32 @@ static void ensure_host_key(const std::string& path) {
 }
 
 // ---- authorized_keys ----
-static std::vector<ssh_key> load_auth_keys(const std::string& path) {
-    std::vector<ssh_key> keys;
+struct AuthKey { ssh_key key; std::string comment; };
+
+static std::vector<AuthKey> load_auth_keys(const std::string& path) {
+    std::vector<AuthKey> keys;
     std::ifstream f(path);
     if (!f) { LOG("authorized_keys not found: %s", path.c_str()); return keys; }
     std::string line;
     while (std::getline(f, line)) {
         if (line.empty() || line[0] == '#') continue;
         std::istringstream is(line);
-        std::string type, b64; is >> type >> b64;
+        std::string type, b64, comment;
+        is >> type >> b64;
+        std::getline(is, comment);                 // rest of line = comment
+        auto p = comment.find_first_not_of(" \t");
+        comment = (p != std::string::npos) ? comment.substr(p) : "";
         if (type.empty() || b64.empty()) continue;
         ssh_keytypes_e t = ssh_key_type_from_name(type.c_str());
         ssh_key k = nullptr;
-        if (ssh_pki_import_pubkey_base64(b64.c_str(), t, &k) == SSH_OK) keys.push_back(k);
+        if (ssh_pki_import_pubkey_base64(b64.c_str(), t, &k) == SSH_OK)
+            keys.push_back({ k, comment });
     }
     LOG("loaded %d authorized keys", (int)keys.size());
     return keys;
 }
-static void free_keys(std::vector<ssh_key>& keys) {
-    for (auto k : keys) ssh_key_free(k);
+static void free_keys(std::vector<AuthKey>& keys) {
+    for (auto& ak : keys) ssh_key_free(ak.key);
     keys.clear();
 }
 
@@ -88,9 +95,9 @@ static std::string key_fp(ssh_key k) {
     return r;
 }
 
-struct Auth { bool ok = false; std::string fp; };
+struct Auth { bool ok = false; std::string fp; std::string comment; };
 
-static Auth authenticate(ssh_session s, const std::vector<ssh_key>& keys) {
+static Auth authenticate(ssh_session s, const std::vector<AuthKey>& keys) {
     ssh_message msg;
     while (true) {
         msg = ssh_message_get(s);
@@ -99,12 +106,12 @@ static Auth authenticate(ssh_session s, const std::vector<ssh_key>& keys) {
         if (t == SSH_REQUEST_AUTH && st == SSH_AUTH_METHOD_PUBLICKEY) {
             ssh_key off = ssh_message_auth_pubkey(msg);
             if (off) {
-                for (ssh_key ak : keys) {
-                    if (ssh_key_cmp(off, ak, SSH_KEY_CMP_PUBLIC) == 0) {
-                        std::string fp = key_fp(off);
+                for (const auto& ak : keys) {
+                    if (ssh_key_cmp(off, ak.key, SSH_KEY_CMP_PUBLIC) == 0) {
+                        Auth r; r.ok = true; r.fp = key_fp(off); r.comment = ak.comment;
                         ssh_message_auth_reply_success(msg, 0);
                         ssh_message_free(msg);
-                        return { true, fp };
+                        return r;
                     }
                 }
             }
@@ -117,6 +124,13 @@ static Auth authenticate(ssh_session s, const std::vector<ssh_key>& keys) {
         }
         ssh_message_free(msg);
     }
+}
+
+// fingerprint -> identities map; else the key's comment; never the raw fp.
+static std::string display_name(App* app, const Auth& a) {
+    const Identity* id = app->identity_for(a.fp);
+    if (id) return id->name + (id->contact.empty() ? "" : " / " + id->contact);
+    return a.comment.empty() ? "(unknown)" : a.comment;
 }
 
 static ssh_channel accept_channel(ssh_session s) {
@@ -226,8 +240,9 @@ static void shell_session(ssh_session s, App* app) {
     Auth a = authenticate(s, keys);
     free_keys(keys);
     if (!a.ok) return;
-    LOG("shell session auth ok: %s", a.fp.c_str());
-    int tok = app->session_start(a.fp);
+    std::string who = display_name(app, a);
+    LOG("shell session auth ok: %s", who.c_str());
+    int tok = app->session_start(who);
     ssh_channel ch = accept_channel(s);
     if (!ch) { app->session_end(tok); return; }
     ChanReq rq = wait_channel_requests(s);
@@ -242,15 +257,14 @@ static void serial_session(ssh_session s, const SerialCfg sc, App* app) {
     Auth a = authenticate(s, keys);
     free_keys(keys);
     if (!a.ok) return;
-    LOG("serial session %s auth ok: %s", sc.name.c_str(), a.fp.c_str());
-    int tok = app->session_start(a.fp);
+    std::string who = display_name(app, a);
+    LOG("serial session %s auth ok: %s", sc.name.c_str(), who.c_str());
+    int tok = app->session_start(who);
 
     ssh_channel ch = accept_channel(s);
     if (!ch) { app->session_end(tok); return; }
     wait_channel_requests(s);   // accept pty/shell (client uses `ssh -t`)
 
-    const Identity* id = app->identity_for(a.fp);
-    std::string who = id ? id->name : a.fp;
     std::string com = app->find_com_for(sc.name);
 
     if (com.empty()) {

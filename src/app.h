@@ -38,7 +38,7 @@ public:
     std::string find_com_for(const std::string& name) const;
 
     // session occupancy (drives overlay). token returned to pair start/end.
-    int  session_start(const std::string& fp);
+    int  session_start(const std::string& display_name);
     void session_end(int token);
 
     // serial exclusive-hold registry (status only; OS enforces exclusivity)
