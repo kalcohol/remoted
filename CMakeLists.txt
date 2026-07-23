@@ -24,6 +24,7 @@ target_include_directories(remoted PRIVATE src)
 
 target_compile_definitions(remoted PRIVATE
   UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN
+  _WIN32_WINNT=0x0A00
   _WINSOCK_DEPRECATED_NO_WARNINGS _CRT_SECURE_NO_WARNINGS
 )
 

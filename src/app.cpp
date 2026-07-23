@@ -2,6 +2,7 @@
 #include "util.h"
 #include "log.h"
 #include <algorithm>
+#include <map>
 
 void App::start() {
     devs_ = enumerate_com_ports();
@@ -34,10 +35,10 @@ std::string App::find_com_for(const std::string& name) const {
     return "";
 }
 
-int App::session_start(const std::string& display_name) {
+int App::session_start(const std::string& scope, const std::string& display_name) {
     std::lock_guard<std::mutex> lk(m_);
     int t = next_token_++;
-    holders_[t] = display_name;
+    holders_[t] = { scope, display_name };
     active_++;
     if (hwnd_main) PostMessage(hwnd_main, WM_APP_STATE, 1, 0);
     return t;
@@ -78,20 +79,37 @@ const Identity* App::identity_for(const std::string& fp) const {
     return it == cfg.identities.end() ? nullptr : &it->second;
 }
 
+std::vector<std::string> App::shell_holders() const {
+    std::lock_guard<std::mutex> lk(m_);
+    std::vector<std::string> r;
+    for (const auto& kv : holders_) if (kv.second.first == "shell") r.push_back(kv.second.second);
+    return r;
+}
+
 std::wstring App::overlay_text() const {
     std::string s = cfg.overlay.message;
     if (s.empty()) s = "Remote session active - please do not operate";
-    s += "\r\n\r\nOccupied by: ";
-    std::string names;
+    s += "\r\n\r\n";
+
+    // group holders by scope ("shell" first, then each serial by config name)
+    std::map<std::string, std::vector<std::string>> byScope;
     {
         std::lock_guard<std::mutex> lk(m_);
-        for (const auto& kv : holders_) {
-            if (!names.empty()) names += ", ";
-            names += kv.second;
-        }
+        for (const auto& kv : holders_) byScope[kv.second.first].push_back(kv.second.second);
     }
-    if (names.empty()) names = "(unknown)";
-    s += names;
-    s += "\r\n\r\nPlease Love & Peace :)    [Disconnect / Minimize below]";
+    auto join = [](const std::vector<std::string>& v) {
+        std::string r;
+        for (size_t i = 0; i < v.size(); ++i) { if (i) r += ", "; r += v[i]; }
+        return r;
+    };
+    auto it = byScope.find("shell");
+    if (it != byScope.end() && !it->second.empty())
+        s += "Shell  : " + join(it->second) + "\r\n";
+    for (const auto& kv : byScope) {
+        if (kv.first == "shell" || kv.second.empty()) continue;
+        s += kv.first + " : " + join(kv.second) + "\r\n";
+    }
+
+    s += "\r\nPlease Love & Peace :)    [Disconnect / Minimize below]";
     return utf8_to_wide(s);
 }

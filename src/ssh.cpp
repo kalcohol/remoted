@@ -21,25 +21,29 @@
 #include <deque>
 #include <memory>
 
-// ---- session registry (for disconnect-all) ----
-static std::mutex g_sess_m;
-static std::vector<ssh_session> g_sessions;
+// ---- session abort registry (for disconnect-all) ----
+// disconnect-all only sets flags; each worker polls its own flag and tears down
+// on its own thread -> no cross-thread ssh_* calls (which used to AV).
 static std::atomic<bool> g_stop{ false };
+static std::mutex g_ab_m;
+static std::vector<std::shared_ptr<std::atomic<bool>>> g_aborts;
 
-static void sess_add(ssh_session s) {
-    std::lock_guard<std::mutex> lk(g_sess_m);
-    g_sessions.push_back(s);
+static std::shared_ptr<std::atomic<bool>> reg_abort() {
+    auto a = std::make_shared<std::atomic<bool>>(false);
+    std::lock_guard<std::mutex> lk(g_ab_m);
+    g_aborts.push_back(a);
+    return a;
 }
-static void sess_remove(ssh_session s) {
-    std::lock_guard<std::mutex> lk(g_sess_m);
-    g_sessions.erase(std::remove(g_sessions.begin(), g_sessions.end(), s), g_sessions.end());
+static void unreg_abort(const std::shared_ptr<std::atomic<bool>>& a) {
+    std::lock_guard<std::mutex> lk(g_ab_m);
+    g_aborts.erase(std::remove(g_aborts.begin(), g_aborts.end(), a), g_aborts.end());
 }
 
 void ssh_disconnect_all() {
-    std::vector<ssh_session> copy;
-    { std::lock_guard<std::mutex> lk(g_sess_m); copy = g_sessions; }
-    LOG("disconnect-all: %d sessions", (int)copy.size());
-    for (auto s : copy) ssh_disconnect(s);
+    std::vector<std::shared_ptr<std::atomic<bool>>> copy;
+    { std::lock_guard<std::mutex> lk(g_ab_m); copy = g_aborts; }
+    LOG("disconnect-all: flagging %d session(s)", (int)copy.size());
+    for (auto& a : copy) a->store(true);
 }
 
 // ---- host key ----
@@ -71,7 +75,7 @@ static std::vector<AuthKey> load_auth_keys(const std::string& path) {
         std::istringstream is(line);
         std::string type, b64, comment;
         is >> type >> b64;
-        std::getline(is, comment);                 // rest of line = comment
+        std::getline(is, comment);
         auto p = comment.find_first_not_of(" \t");
         comment = (p != std::string::npos) ? comment.substr(p) : "";
         if (type.empty() || b64.empty()) continue;
@@ -129,11 +133,13 @@ static Auth authenticate(ssh_session s, const std::vector<AuthKey>& keys) {
     }
 }
 
-// fingerprint -> identities map; else the key's comment; never the raw fp.
+// fingerprint -> identities map; else the key's comment; else a short key id (never "unknown").
 static std::string display_name(App* app, const Auth& a) {
     const Identity* id = app->identity_for(a.fp);
     if (id) return id->name + (id->contact.empty() ? "" : " / " + id->contact);
-    return a.comment.empty() ? "(unknown)" : a.comment;
+    if (!a.comment.empty()) return a.comment;
+    auto p = a.fp.find(':');
+    return "key:" + (p != std::string::npos ? a.fp.substr(p + 1, 12) : a.fp.substr(0, 12));
 }
 
 static ssh_channel accept_channel(ssh_session s) {
@@ -160,11 +166,11 @@ static ChanReq wait_channel_requests(ssh_session s) {
         if (!msg) break;
         if (ssh_message_type(msg) == SSH_REQUEST_CHANNEL) {
             int st = ssh_message_subtype(msg);
-            if (st == SSH_CHANNEL_REQUEST_PTY)          { ssh_message_channel_request_reply_success(msg); }
-            else if (st == SSH_CHANNEL_REQUEST_WINDOW_CHANGE) { ssh_message_channel_request_reply_success(msg); }
-            else if (st == SSH_CHANNEL_REQUEST_ENV)     { ssh_message_channel_request_reply_success(msg); }
-            else if (st == SSH_CHANNEL_REQUEST_SHELL)   { ssh_message_channel_request_reply_success(msg); r.shell = true; }
-            else if (st == SSH_CHANNEL_REQUEST_EXEC)    {
+            if (st == SSH_CHANNEL_REQUEST_PTY)               { ssh_message_channel_request_reply_success(msg); }
+            else if (st == SSH_CHANNEL_REQUEST_WINDOW_CHANGE){ ssh_message_channel_request_reply_success(msg); }
+            else if (st == SSH_CHANNEL_REQUEST_ENV)          { ssh_message_channel_request_reply_success(msg); }
+            else if (st == SSH_CHANNEL_REQUEST_SHELL)        { ssh_message_channel_request_reply_success(msg); r.shell = true; }
+            else if (st == SSH_CHANNEL_REQUEST_EXEC) {
                 const char* cmd = ssh_message_channel_request_command(msg);
                 r.exec_cmd = cmd ? cmd : "";
                 ssh_message_channel_request_reply_success(msg);
@@ -189,9 +195,13 @@ static void send_motd(ssh_channel ch, App& app) {
     ssh_channel_write(ch, m.data(), (uint32_t)m.size());
 }
 
-// ---- shell / exec via cmd.exe ----
-static void run_shell(ssh_channel ch, const AppConfig& cfg, bool exec, const std::string& exec_cmd) {
-    std::wstring cmdline = exec ? (L"cmd.exe /C " + utf8_to_wide(exec_cmd)) : L"cmd.exe /Q";
+// ---- child process pump (pipes) ----
+// exec: cmd /C <cmd>. interactive shell: cmd.exe, where we provide local echo and
+// translate \r -> \r\n (cmd over a pipe does not echo and needs CRLF line endings).
+// Uses ssh_channel_read_timeout so the abort flag and channel close are both honored.
+static void run_shell(ssh_channel ch, const AppConfig& cfg, bool exec, const std::string& exec_cmd,
+                      const std::shared_ptr<std::atomic<bool>>& abort) {
+    std::wstring cmdline = exec ? (L"cmd.exe /C " + utf8_to_wide(exec_cmd)) : L"cmd.exe";
     std::wstring cwd = utf8_to_wide(cfg.shell_dir);
 
     SECURITY_ATTRIBUTES sa{ sizeof(sa), nullptr, TRUE };
@@ -205,63 +215,58 @@ static void run_shell(ssh_channel ch, const AppConfig& cfg, bool exec, const std
     si.dwFlags = STARTF_USESTDHANDLES;
     si.hStdInput = cInR; si.hStdOutput = cOutW; si.hStdError = cOutW;
     PROCESS_INFORMATION pi{};
-
-    std::vector<wchar_t> clbuf(cmdline.begin(), cmdline.end()); clbuf.push_back(0);
-    BOOL ok = CreateProcessW(nullptr, clbuf.data(), nullptr, nullptr, TRUE,
+    std::vector<wchar_t> cl(cmdline.begin(), cmdline.end()); cl.push_back(0);
+    BOOL ok = CreateProcessW(nullptr, cl.data(), nullptr, nullptr, TRUE,
                              CREATE_NO_WINDOW, nullptr,
                              cwd.empty() ? nullptr : cwd.c_str(), &si, &pi);
     CloseHandle(cInR); CloseHandle(cOutW);
     if (!ok) {
-        const char* e = "remoted: failed to spawn shell\r\n";
+        const char* e = "remoted: CreateProcess failed\r\n";
         ssh_channel_write(ch, e, (uint32_t)strlen(e));
         CloseHandle(cInW); CloseHandle(cOutR);
         return;
     }
 
-    // pipe(stdout) -> channel
-    std::thread reader([cOutR, ch]() {
-        char buf[4096]; DWORD n;
-        while (ReadFile(cOutR, buf, sizeof buf, &n, nullptr) && n > 0)
-            ssh_channel_write(ch, buf, (uint32_t)n);
-        ssh_channel_send_eof(ch);
+    // channel writes are serialized (reader + echo both write)
+    auto cw = std::make_shared<std::mutex>();
+    std::thread reader([cOutR, ch, cw]() {
+        char b[4096]; DWORD n;
+        while (ReadFile(cOutR, b, sizeof b, &n, nullptr) && n > 0) {
+            std::lock_guard<std::mutex> lk(*cw);
+            ssh_channel_write(ch, b, (uint32_t)n);
+        }
+        { std::lock_guard<std::mutex> lk(*cw); ssh_channel_send_eof(ch); }
         CloseHandle(cOutR);
     });
 
-    // channel -> pipe(stdin)
     char buf[4096];
     while (true) {
-        int r = ssh_channel_read(ch, buf, sizeof buf, 0);
-        if (r <= 0) break;
-        DWORD w = 0; WriteFile(cInW, buf, (DWORD)r, &w, nullptr);
+        if (abort->load()) break;
+        int r = ssh_channel_read_timeout(ch, buf, sizeof buf, 0, 200);
+        if (r > 0) {
+            if (exec) {
+                DWORD w = 0; WriteFile(cInW, buf, (DWORD)r, &w, nullptr);
+            } else {
+                { std::lock_guard<std::mutex> lk(*cw); ssh_channel_write(ch, buf, (uint32_t)r); } // local echo
+                std::string out; out.reserve(r + 8);
+                for (int i = 0; i < r; ++i) out += (buf[i] == '\r') ? std::string("\r\n") : std::string(1, buf[i]);
+                DWORD w = 0; WriteFile(cInW, out.data(), (DWORD)out.size(), &w, nullptr);
+            }
+        } else if (r < 0) {
+            break;
+        } else if (ssh_channel_is_closed(ch) || ssh_channel_is_eof(ch)) {
+            break;
+        }
     }
+
     CloseHandle(cInW);
+    if (abort->load()) TerminateProcess(pi.hProcess, 1);
     WaitForSingleObject(pi.hProcess, 3000);
     reader.join();
     CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
 }
 
-// ---- session handlers ----
-static void shell_session(ssh_session s, App* app) {
-    auto keys = load_auth_keys(app->cfg.authorized_keys);
-    Auth a = authenticate(s, keys);
-    free_keys(keys);
-    if (!a.ok) return;
-    std::string who = display_name(app, a);
-    LOG("shell session auth ok: %s", who.c_str());
-    int tok = app->session_start(who);
-    ssh_channel ch = accept_channel(s);
-    if (!ch) { app->session_end(tok); return; }
-    ChanReq rq = wait_channel_requests(s);
-    send_motd(ch, *app);
-    run_shell(ch, app->cfg, rq.exec, rq.exec_cmd);
-    ssh_channel_send_eof(ch); ssh_channel_close(ch); ssh_channel_free(ch);
-    app->session_end(tok);
-}
-
 // ---- shared serial bridge ----
-// One COM port is opened once; multiple viewers can attach. The reader thread
-// fans UART output into each viewer's queue; each session thread drains its own
-// queue and polls its own channel, so channel I/O stays single-threaded per session.
 struct Attach {
     ssh_channel ch;
     std::mutex qm;
@@ -287,10 +292,7 @@ struct SerialBridge : std::enable_shared_from_this<SerialBridge> {
                 if (n > 0) {
                     std::lock_guard<std::mutex> lk(self->att_m);
                     std::string chunk(b, n);
-                    for (auto& a : self->attaches) {
-                        std::lock_guard<std::mutex> ql(a->qm);
-                        a->outq.push_back(chunk);
-                    }
+                    for (auto& a : self->attaches) { std::lock_guard<std::mutex> ql(a->qm); a->outq.push_back(chunk); }
                 } else if (n < 0) break;
             }
         });
@@ -345,6 +347,26 @@ static void bridge_release(const std::string& name, const std::shared_ptr<Attach
     }
 }
 
+// ---- session handlers ----
+static void shell_session(ssh_session s, App* app) {
+    auto keys = load_auth_keys(app->cfg.authorized_keys);
+    Auth a = authenticate(s, keys);
+    free_keys(keys);
+    if (!a.ok) return;
+    std::string who = display_name(app, a);
+    LOG("shell session auth ok: %s", who.c_str());
+    int tok = app->session_start("shell", who);
+    auto abort = reg_abort();
+    ssh_channel ch = accept_channel(s);
+    if (!ch) { unreg_abort(abort); app->session_end(tok); return; }
+    ChanReq rq = wait_channel_requests(s);
+    send_motd(ch, *app);
+    run_shell(ch, app->cfg, rq.exec, rq.exec_cmd, abort);
+    ssh_channel_send_eof(ch); ssh_channel_close(ch); ssh_channel_free(ch);
+    unreg_abort(abort);
+    app->session_end(tok);
+}
+
 static void serial_session(ssh_session s, const SerialCfg sc, App* app) {
     auto keys = load_auth_keys(app->cfg.authorized_keys);
     Auth a = authenticate(s, keys);
@@ -352,12 +374,13 @@ static void serial_session(ssh_session s, const SerialCfg sc, App* app) {
     if (!a.ok) return;
     std::string who = display_name(app, a);
     LOG("serial session %s auth ok: %s", sc.name.c_str(), who.c_str());
-    int tok = app->session_start(who);
+    int tok = app->session_start(sc.name, who);
+    auto abort = reg_abort();
     app->mark_busy(sc.name, who);
 
     ssh_channel ch = accept_channel(s);
-    if (!ch) { app->clear_busy(sc.name, who); app->session_end(tok); return; }
-    wait_channel_requests(s);   // accept pty/shell (client uses `ssh -t`)
+    if (!ch) { app->clear_busy(sc.name, who); unreg_abort(abort); app->session_end(tok); return; }
+    wait_channel_requests(s);
 
     std::string com = app->find_com_for(sc.name);
     if (com.empty()) {
@@ -372,6 +395,7 @@ static void serial_session(ssh_session s, const SerialCfg sc, App* app) {
             auto at = b->attach(ch);
             char buf[4096];
             while (true) {
+                if (abort->load()) break;
                 int avail = ssh_channel_poll(ch, 0);
                 if (avail < 0) break;
                 if (avail > 0) {
@@ -388,7 +412,7 @@ static void serial_session(ssh_session s, const SerialCfg sc, App* app) {
                         at->outq.pop_front();
                     }
                 }
-                if (ssh_channel_is_eof(ch)) break;
+                if (ssh_channel_is_eof(ch) || ssh_channel_is_closed(ch)) break;
                 if (avail == 0) Sleep(5);
             }
             bridge_release(sc.name, at);
@@ -397,6 +421,7 @@ static void serial_session(ssh_session s, const SerialCfg sc, App* app) {
 
     ssh_channel_send_eof(ch); ssh_channel_close(ch); ssh_channel_free(ch);
     app->clear_busy(sc.name, who);
+    unreg_abort(abort);
     app->session_end(tok);
 }
 
@@ -425,10 +450,8 @@ static void accept_loop(ssh_bind b, App* app, std::function<void(ssh_session, Ap
             Sleep(50); continue;
         }
         std::thread([s, app, fn]() {
-            sess_add(s);
             if (ssh_handle_key_exchange(s) == SSH_OK) fn(s, app);
             else LOG("kex failed: %s", ssh_get_error(s));
-            sess_remove(s);
             ssh_disconnect(s); ssh_free(s);
         }).detach();
     }

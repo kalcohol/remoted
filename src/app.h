@@ -37,8 +37,10 @@ public:
     std::string find_com_for(const std::string& name) const;
 
     // session occupancy (drives overlay). token returned to pair start/end.
-    int  session_start(const std::string& display_name);
+    // scope = "shell" (main shell user) or the serial name.
+    int  session_start(const std::string& scope, const std::string& display_name);
     void session_end(int token);
+    std::vector<std::string> shell_holders() const;
 
     // serial hold registry (status only; sharing is handled by the ssh layer)
     bool mark_busy(const std::string& name, const std::string& holder);
@@ -53,6 +55,6 @@ private:
     mutable std::mutex       m_;
     std::atomic<int>         next_token_{1};
     int                      active_ = 0;
-    std::unordered_map<int, std::string> holders_;      // token -> display name
+    std::unordered_map<int, std::pair<std::string,std::string>> holders_;  // token -> {scope, name}
     std::vector<SerialStatus> status_;
 };
