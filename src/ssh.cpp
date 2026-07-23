@@ -196,12 +196,13 @@ static void send_motd(ssh_channel ch, App& app) {
 }
 
 // ---- child process pump (pipes) ----
-// exec: cmd /C <cmd>. interactive shell: cmd.exe, where we provide local echo and
-// translate \r -> \r\n (cmd over a pipe does not echo and needs CRLF line endings).
-// Uses ssh_channel_read_timeout so the abort flag and channel close are both honored.
+// exec: cmd /C <cmd>. interactive shell: cmd /K, where we provide local echo and
+// translate \r -> \r\n (cmd over a pipe neither echoes nor treats lone \r as Enter).
+// IMPORTANT: all ssh_channel_* calls happen on this (main) thread only. The reader
+// thread just pushes child stdout into a queue -> no concurrent channel access.
 static void run_shell(ssh_channel ch, const AppConfig& cfg, bool exec, const std::string& exec_cmd,
                       const std::shared_ptr<std::atomic<bool>>& abort) {
-    std::wstring cmdline = exec ? (L"cmd.exe /C " + utf8_to_wide(exec_cmd)) : L"cmd.exe";
+    std::wstring cmdline = exec ? (L"cmd.exe /C " + utf8_to_wide(exec_cmd)) : L"cmd.exe /K";
     std::wstring cwd = utf8_to_wide(cfg.shell_dir);
 
     SECURITY_ATTRIBUTES sa{ sizeof(sa), nullptr, TRUE };
@@ -227,36 +228,56 @@ static void run_shell(ssh_channel ch, const AppConfig& cfg, bool exec, const std
         return;
     }
 
-    // channel writes are serialized (reader + echo both write)
-    auto cw = std::make_shared<std::mutex>();
-    std::thread reader([cOutR, ch, cw]() {
+    // reader: child stdout -> queue (never touches the channel)
+    struct Q { std::mutex m; std::deque<std::string> q; bool eof = false; };
+    auto Q_ = std::make_shared<Q>();
+    std::thread reader([cOutR, Q_]() {
         char b[4096]; DWORD n;
         while (ReadFile(cOutR, b, sizeof b, &n, nullptr) && n > 0) {
-            std::lock_guard<std::mutex> lk(*cw);
-            ssh_channel_write(ch, b, (uint32_t)n);
+            std::lock_guard<std::mutex> lk(Q_->m);
+            Q_->q.emplace_back(b, n);
         }
-        { std::lock_guard<std::mutex> lk(*cw); ssh_channel_send_eof(ch); }
+        std::lock_guard<std::mutex> lk(Q_->m);
+        Q_->eof = true;
         CloseHandle(cOutR);
     });
+
+    auto drain = [&]() {
+        std::lock_guard<std::mutex> lk(Q_->m);
+        while (!Q_->q.empty()) {
+            const auto& s = Q_->q.front();
+            ssh_channel_write(ch, s.data(), (uint32_t)s.size());
+            Q_->q.pop_front();
+        }
+    };
 
     char buf[4096];
     while (true) {
         if (abort->load()) break;
-        int r = ssh_channel_read_timeout(ch, buf, sizeof buf, 0, 200);
-        if (r > 0) {
-            if (exec) {
-                DWORD w = 0; WriteFile(cInW, buf, (DWORD)r, &w, nullptr);
-            } else {
-                { std::lock_guard<std::mutex> lk(*cw); ssh_channel_write(ch, buf, (uint32_t)r); } // local echo
-                std::string out; out.reserve(r + 8);
-                for (int i = 0; i < r; ++i) out += (buf[i] == '\r') ? std::string("\r\n") : std::string(1, buf[i]);
-                DWORD w = 0; WriteFile(cInW, out.data(), (DWORD)out.size(), &w, nullptr);
+        drain();   // child output -> channel
+
+        int avail = ssh_channel_poll_timeout(ch, 50, 0);   // wait up to 50ms for input
+        if (avail > 0) {
+            int rd = (avail < (int)sizeof buf) ? avail : (int)sizeof buf;
+            int r = ssh_channel_read(ch, buf, (uint32_t)rd, 0);
+            if (r > 0) {
+                if (exec) {
+                    DWORD w = 0; WriteFile(cInW, buf, (DWORD)r, &w, nullptr);
+                } else {
+                    ssh_channel_write(ch, buf, (uint32_t)r);                       // local echo
+                    std::string out; out.reserve(r + 8);
+                    for (int i = 0; i < r; ++i) out += (buf[i] == '\r') ? std::string("\r\n") : std::string(1, buf[i]);
+                    DWORD w = 0; WriteFile(cInW, out.data(), (DWORD)out.size(), &w, nullptr);
+                }
             }
-        } else if (r < 0) {
-            break;
-        } else if (ssh_channel_is_closed(ch) || ssh_channel_is_eof(ch)) {
-            break;
         }
+        // note: do NOT break on avail<=0 - for exec the client EOFs its stdin right
+        // after the request; we must keep draining cmd output until cmd exits.
+
+        bool childDone;
+        { std::lock_guard<std::mutex> lk(Q_->m); childDone = Q_->eof; }
+        if (childDone) { drain(); ssh_channel_send_eof(ch); break; }
+        if (ssh_channel_is_closed(ch)) break;
     }
 
     CloseHandle(cInW);
@@ -286,15 +307,18 @@ struct SerialBridge : std::enable_shared_from_this<SerialBridge> {
     void start_reader() {
         auto self = shared_from_this();
         reader = std::thread([self]() {
-            char b[4096]; int n;
+            char b[4096]; int n; long total = 0; bool logged = false;
             while (!self->stop) {
                 n = self->sp.read(b, sizeof b, 100);
                 if (n > 0) {
+                    total += n;
+                    if (!logged) { LOG("serial %s: first data %d bytes", self->name.c_str(), n); logged = true; }
                     std::lock_guard<std::mutex> lk(self->att_m);
                     std::string chunk(b, n);
                     for (auto& a : self->attaches) { std::lock_guard<std::mutex> ql(a->qm); a->outq.push_back(chunk); }
-                } else if (n < 0) break;
+                } else if (n < 0) { LOG("serial %s: read error", self->name.c_str()); break; }
             }
+            LOG("serial %s: reader stopped, total %ld bytes", self->name.c_str(), total);
         });
     }
     std::shared_ptr<Attach> attach(ssh_channel ch) {

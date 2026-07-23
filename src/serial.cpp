@@ -21,10 +21,7 @@ bool SerialPort::open(const std::string& com, uint32_t baud) {
         dcb.fBinary = TRUE; dcb.fParity = FALSE;
         SetCommState(h_, &dcb);
     }
-    COMMTIMEOUTS to{};
-    to.ReadIntervalTimeout = MAXDWORD;
-    to.ReadTotalTimeoutConstant = 0; to.ReadTotalTimeoutMultiplier = 0;
-    to.WriteTotalTimeoutConstant = 0; to.WriteTotalTimeoutMultiplier = 0;
+    COMMTIMEOUTS to{};   // all zero: overlapped reads pend until data arrives
     SetCommTimeouts(h_, &to);
     PurgeComm(h_, PURGE_RXCLEAR | PURGE_TXCLEAR);
     LOG("serial opened %s @%u", com.c_str(), baud);
