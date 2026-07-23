@@ -11,6 +11,7 @@
 
 #include <windows.h>
 #include <jobapi.h>
+#include <ioapiset.h>
 #include <thread>
 #include <atomic>
 #include <vector>
@@ -215,23 +216,39 @@ static void send_motd(ssh_channel ch, App& app) {
     ssh_channel_write(ch, m.data(), (uint32_t)m.size());
 }
 
+// anonymous pipe whose READ end is overlapped, so CancelIoEx can cancel a
+// blocked read on teardown (closing a handle does NOT cancel in-flight sync I/O,
+// and a synchronous pipe read can't otherwise be interrupted).
+static std::atomic<unsigned> g_pipe_seq{0};
+static bool make_overlapped_pipe(HANDLE& rd, HANDLE& wr) {
+    std::wstring name = L"\\\\.\\pipe\\remoted_anon_" + std::to_wstring(GetCurrentProcessId())
+                        + L"_" + std::to_wstring(g_pipe_seq.fetch_add(1));
+    rd = CreateNamedPipeW(name.c_str(), PIPE_ACCESS_INBOUND | FILE_FLAG_OVERLAPPED,
+                          PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT, 1, 8192, 8192, 0, nullptr);
+    if (rd == INVALID_HANDLE_VALUE) return false;
+    SECURITY_ATTRIBUTES sa{ sizeof(sa), nullptr, TRUE };
+    wr = CreateFileW(name.c_str(), GENERIC_WRITE, 0, &sa, OPEN_EXISTING, 0, nullptr);
+    if (wr == INVALID_HANDLE_VALUE) { CloseHandle(rd); rd = INVALID_HANDLE_VALUE; return false; }
+    return true;
+}
+
 // ---- child process pump (pipes + OEM<->UTF-8 transcoding) ----
 // exec: cmd /C <cmd>. interactive shell: cmd /K with local echo + \r->\r\n.
 // All ssh_channel_* calls are on this thread only; the reader pushes child
-// output (already converted to UTF-8) into a queue. The child runs in a job
-// object so we can kill the whole tree -> the stdout pipe always EOFs and the
-// reader can never block join forever (e.g. cmd spawns a background process).
+// output (already converted to UTF-8) into a queue. The stdout read end is an
+// overlapped pipe so we can CancelIoEx it on teardown -> the reader always
+// unblocks and join() never deadlocks (even if a grandchild holds the pipe).
 static void run_shell(ssh_channel ch, const AppConfig& cfg, bool exec, const std::string& exec_cmd,
                       const std::shared_ptr<std::atomic<bool>>& abort) {
     std::wstring cmdline = exec ? (L"cmd.exe /C " + utf8_to_wide(exec_cmd)) : L"cmd.exe /K";
     std::wstring cwd = utf8_to_wide(cfg.shell_dir);
 
     SECURITY_ATTRIBUTES sa{ sizeof(sa), nullptr, TRUE };
-    HANDLE cInR, cInW, cOutR, cOutW;
+    HANDLE cInR, cInW;
     if (!CreatePipe(&cInR, &cInW, &sa, 0)) return;
     SetHandleInformation(cInW, HANDLE_FLAG_INHERIT, 0);
-    if (!CreatePipe(&cOutR, &cOutW, &sa, 0)) { CloseHandle(cInR); CloseHandle(cInW); return; }
-    SetHandleInformation(cOutR, HANDLE_FLAG_INHERIT, 0);
+    HANDLE cOutR, cOutW;
+    if (!make_overlapped_pipe(cOutR, cOutW)) { CloseHandle(cInR); CloseHandle(cInW); return; }
 
     STARTUPINFOW si{}; si.cb = sizeof(si);
     si.dwFlags = STARTF_USESTDHANDLES;
@@ -241,7 +258,7 @@ static void run_shell(ssh_channel ch, const AppConfig& cfg, bool exec, const std
     BOOL ok = CreateProcessW(nullptr, cl.data(), nullptr, nullptr, TRUE,
                              CREATE_NO_WINDOW, nullptr,
                              cwd.empty() ? nullptr : cwd.c_str(), &si, &pi);
-    CloseHandle(cInR); CloseHandle(cOutW);
+    CloseHandle(cInR); CloseHandle(cOutW); CloseHandle(pi.hThread);
     if (!ok) {
         const char* e = "remoted: CreateProcess failed\r\n";
         ssh_channel_write(ch, e, (uint32_t)strlen(e));
@@ -253,16 +270,26 @@ static void run_shell(ssh_channel ch, const AppConfig& cfg, bool exec, const std
     struct Q { std::mutex m; std::deque<std::string> q; bool eof = false; };
     auto Q_ = std::make_shared<Q>();
     auto oemCarry = std::make_shared<std::string>();
-    std::thread reader([cOutR, Q_, oemCarry]() {
-        char b[4096]; DWORD n;
-        while (ReadFile(cOutR, b, sizeof b, &n, nullptr) && n > 0) {
+    HANDLE readEv = CreateEvent(nullptr, TRUE, FALSE, nullptr);
+    std::thread reader([cOutR, readEv, Q_, oemCarry]() {
+        char b[8192]; DWORD n;
+        for (;;) {
+            OVERLAPPED ov{}; ov.hEvent = readEv;
+            ResetEvent(readEv);
+            BOOL ok = ReadFile(cOutR, b, sizeof b, &n, &ov);
+            if (ok) { if (n == 0) break; }
+            else if (GetLastError() == ERROR_IO_PENDING) {
+                WaitForSingleObject(readEv, INFINITE);
+                DWORD got = 0;
+                if (!GetOverlappedResult(cOutR, &ov, &got, FALSE)) break;  // cancelled / error
+                n = got;
+                if (n == 0) break;
+            } else break;
             std::string s = cp_oem2utf8(b, n, *oemCarry);
             if (!s.empty()) { std::lock_guard<std::mutex> lk(Q_->m); Q_->q.push_back(s); }
         }
         std::lock_guard<std::mutex> lk(Q_->m);
         Q_->eof = true;
-        // note: cOutR is closed by the caller after join (closing it here would
-        // race with the caller's "close to unblock" on shutdown).
     });
 
     auto drain = [&]() {
@@ -281,7 +308,6 @@ static void run_shell(ssh_channel ch, const AppConfig& cfg, bool exec, const std
         if (abort->load()) break;
         drain();
 
-        // client closed its stdin -> propagate EOF to the child (once)
         if (!stdinClosed && ssh_channel_is_eof(ch)) {
             CloseHandle(cInW); cInW = INVALID_HANDLE_VALUE; stdinClosed = true;
         }
@@ -294,7 +320,7 @@ static void run_shell(ssh_channel ch, const AppConfig& cfg, bool exec, const std
                 if (exec) {
                     DWORD w = 0; if (cInW != INVALID_HANDLE_VALUE) WriteFile(cInW, buf, (DWORD)r, &w, nullptr);
                 } else {
-                    ssh_channel_write(ch, buf, (uint32_t)r);                       // local echo (raw UTF-8)
+                    ssh_channel_write(ch, buf, (uint32_t)r);
                     std::string exp; exp.reserve(r + 8);
                     for (int i = 0; i < r; ++i) exp += (buf[i] == '\r') ? std::string("\r\n") : std::string(1, buf[i]);
                     std::string oem = cp_utf82oem(exp.data(), exp.size(), u2oCarry);
@@ -313,11 +339,16 @@ static void run_shell(ssh_channel ch, const AppConfig& cfg, bool exec, const std
     if (cInW != INVALID_HANDLE_VALUE) { CloseHandle(cInW); cInW = INVALID_HANDLE_VALUE; }
     if (abort->load() || !childDone) TerminateProcess(pi.hProcess, 1);
     WaitForSingleObject(pi.hProcess, 3000);
-    DWORD code = 1;
-    GetExitCodeProcess(pi.hProcess, &code);
-    ssh_channel_request_send_exit_status(ch, (int)code);
-    CloseHandle(cOutR);   // unblocks a still-blocked reader (e.g. a grandchild holds the write end)
-    reader.join();
+    if (exec) {   // only exec has a meaningful exit code (interactive shells don't)
+        DWORD code = 1;
+        GetExitCodeProcess(pi.hProcess, &code);
+        if (code == STILL_ACTIVE) code = 1;
+        ssh_channel_request_send_exit_status(ch, (int)code);
+    }
+    CancelIoEx(cOutR, nullptr);   // cancel any in-flight overlapped read on cOutR (any thread)
+    reader.join();                // reader's GetOverlappedResult now returns FALSE -> it exits
+    CloseHandle(readEv);
+    CloseHandle(cOutR);
     CloseHandle(pi.hProcess);
 }
 
