@@ -12,7 +12,11 @@ void App::start() {
         st.name        = s.name;
         st.listen_port = s.listen_port;
         st.com         = resolve_com(s, devs_);
-        st.present     = !st.com.empty();
+        // present only if the resolved COM actually exists on THIS machine
+        st.present = false;
+        for (const auto& e : devs_) {
+            if (e.com == st.com) { st.present = true; break; }
+        }
         status_.push_back(st);
         LOG("serial[%s] -> %s (%s)", s.name.c_str(), st.com.c_str(),
             st.present ? "present" : "absent");
