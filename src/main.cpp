@@ -61,7 +61,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
 
     std::wstring logpath  = exe_dir + L"\\remoted.log";
     std::wstring crashp   = exe_dir + L"\\remoted.crash.log";
-    wcscpy_s(g_crashlog, crashp.c_str());
+    wcsncpy_s(g_crashlog, MAX_PATH, crashp.c_str(), _TRUNCATE);
     log_init(logpath);
     LOG("=== remoted starting (exe_dir=%s) ===", wide_to_utf8(exe_dir).c_str());
 
@@ -84,8 +84,14 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
     App app;
     app.config_path = cfg_path;
     LOG("step: loading config");
-    app.cfg = load_config(cfg_path);
-    LOG("step: config loaded");
+    bool cfg_ok = true;
+    app.cfg = load_config(cfg_path, &cfg_ok);
+    LOG("step: config loaded (ok=%d)", cfg_ok ? 1 : 0);
+    if (!cfg_ok) {
+        MessageBoxW(nullptr,
+            L"remoted.json failed to parse - using defaults. Check the file (must be UTF-8).",
+            L"remoted config", MB_ICONWARNING);
+    }
 
     // authorized_keys: prefer the standard %USERPROFILE%\.ssh\authorized_keys
     // if it exists and the user did not point the config elsewhere.

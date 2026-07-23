@@ -29,13 +29,25 @@ void log_line(const char* fmt, ...) {
     OutputDebugStringA(line);
 
     std::lock_guard<std::mutex> lk(g_m);
-    if (!g_path.empty()) {
-        HANDLE h = CreateFileW(g_path.c_str(), FILE_APPEND_DATA,
-                               FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
-                               OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-        if (h != INVALID_HANDLE_VALUE) {
-            DWORD w = 0; WriteFile(h, line, (DWORD)(pre + n + 1), &w, nullptr);
-            CloseHandle(h);
+    if (g_path.empty()) return;
+
+    // rotate when the log exceeds 1 MB
+    WIN32_FILE_ATTRIBUTE_DATA fa;
+    if (GetFileAttributesExW(g_path.c_str(), GetFileExInfoStandard, &fa)) {
+        unsigned long long sz = ((unsigned long long)fa.nFileSizeHigh << 32) | fa.nFileSizeLow;
+        if (sz > 1024 * 1024) {
+            std::wstring old = g_path + L".old";
+            MoveFileExW(g_path.c_str(), old.c_str(), MOVEFILE_REPLACE_EXISTING);
         }
+    }
+
+    HANDLE h = CreateFileW(g_path.c_str(), FILE_APPEND_DATA,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                           OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h != INVALID_HANDLE_VALUE) {
+        DWORD hi = 0, lo = GetFileSize(h, &hi);
+        if (lo == 0 && hi == 0) { DWORD w = 0; WriteFile(h, "\xef\xbb\xbf", 3, &w, nullptr); }  // UTF-8 BOM
+        DWORD w = 0; WriteFile(h, line, (DWORD)(pre + n + 1), &w, nullptr);
+        CloseHandle(h);
     }
 }

@@ -129,9 +129,11 @@ Then:
 ```bash
 ssh haps                  # shell (drops in shell_dir)
 ssh haps "burn.bat 0"     # run a script, logs stream back
-ssh haps0                 # directly on the haps0 UART console
-ssh haps -t haps0         # equivalent one-shot
+ssh haps0                 # directly on the haps0 UART console (own listener port)
 ```
+> Each serial is its own ssh listener port (see `.ssh/config` `Host haps0`), so
+> `ssh haps0` is the way to reach a UART. Do **not** use `ssh haps -t haps0` —
+> that would just run `cmd /C haps0` on the main shell.
 `ssh haps` prints a **banner** listing every serial, its port, and status (`[ready]` /
 `[in-use <holder>]` / `[absent]`).
 

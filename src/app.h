@@ -13,6 +13,7 @@
 #define WM_APP_TRAY    (WM_APP + 2)   // tray icon callback
 #define WM_APP_EXIT    (WM_APP + 3)   // request quit
 #define WM_APP_BALLOON (WM_APP + 4)   // 2nd instance asked us to re-announce
+#define WM_APP_NOTIFY  (WM_APP + 5)   // a pending balloon notification
 #define TIMER_RETRACT  9001
 
 struct SerialStatus {
@@ -49,6 +50,11 @@ public:
     void clear_busy(const std::string& name, int token);
 
     const Identity* identity_for(const std::string& fp) const;
+
+    // request a tray balloon (thread-safe; drained by the tray window)
+    void request_notify(const std::wstring& title, const std::wstring& body);
+    std::mutex nm_;
+    std::vector<std::pair<std::wstring, std::wstring>> pending_notify_;
 
     // build the text shown on the overlay (message + active holders)
     std::wstring overlay_text() const;

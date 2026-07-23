@@ -58,9 +58,10 @@ void App::session_end(int token) {
 bool App::mark_busy(const std::string& name, int token, const std::string& holder) {
     std::lock_guard<std::mutex> lk(m_);
     for (auto& st : status_) {
-        if (st.name == name) { st.holders[token] = holder; return true; }
+        if (st.name == name) { st.holders[token] = holder; break; }
     }
-    return false;
+    if (hwnd_main) PostMessage(hwnd_main, WM_APP_STATE, 1, 0);
+    return true;
 }
 
 void App::clear_busy(const std::string& name, int token) {
@@ -68,6 +69,15 @@ void App::clear_busy(const std::string& name, int token) {
     for (auto& st : status_) {
         if (st.name == name) { st.holders.erase(token); break; }
     }
+    if (hwnd_main) PostMessage(hwnd_main, WM_APP_STATE, 1, 0);
+}
+
+void App::request_notify(const std::wstring& title, const std::wstring& body) {
+    {
+        std::lock_guard<std::mutex> lk(nm_);
+        pending_notify_.emplace_back(title, body);
+    }
+    if (hwnd_main) PostMessage(hwnd_main, WM_APP_NOTIFY, 0, 0);
 }
 
 const Identity* App::identity_for(const std::string& fp) const {

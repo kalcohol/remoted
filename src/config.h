@@ -35,4 +35,5 @@ struct AppConfig {
     std::unordered_map<std::string, Identity> identities;   // fingerprint -> identity
 };
 
-AppConfig load_config(const std::string& path);
+// Returns false (and a default config) on a parse error; true on success / file-missing.
+AppConfig load_config(const std::string& path, bool* ok = nullptr);

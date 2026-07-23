@@ -94,6 +94,14 @@ LRESULT CALLBACK Tray::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         if (ov) self->show_balloon(L"remoted already running",
                                    L"ssh session is up - see the tray icon.");
         return 0;
+    case WM_APP_NOTIFY: {
+        if (self) {
+            std::vector<std::pair<std::wstring, std::wstring>> v;
+            { std::lock_guard<std::mutex> lk(app->nm_); v.swap(app->pending_notify_); }
+            for (auto& p : v) self->show_balloon(p.first, p.second);
+        }
+        return 0;
+    }
     case WM_APP_STATE: {
         int active = (int)wp;
         if (app && app->cfg.overlay.enabled && ov) {

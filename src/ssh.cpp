@@ -1,3 +1,6 @@
+#include <winsock2.h>
+#include <ws2tcpip.h>
+
 #include "ssh.h"
 #include "app.h"
 #include "serial.h"
@@ -12,6 +15,7 @@
 #include <windows.h>
 #include <jobapi.h>
 #include <ioapiset.h>
+
 #include <thread>
 #include <atomic>
 #include <vector>
@@ -21,6 +25,7 @@
 #include <sstream>
 #include <algorithm>
 #include <map>
+#include <set>
 #include <deque>
 #include <memory>
 
@@ -42,6 +47,22 @@ static void unreg_abort(const std::shared_ptr<std::atomic<bool>>& a) {
     g_aborts.erase(std::remove(g_aborts.begin(), g_aborts.end(), a), g_aborts.end());
 }
 
+// ports we listen on, so shutdown can wake a blocked ssh_bind_accept via a
+// throwaway localhost connect.
+static std::mutex g_ports_m;
+static std::vector<uint16_t> g_ports;
+
+static void poke_port(uint16_t port) {
+    SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (s == INVALID_SOCKET) return;
+    struct sockaddr_in a{};
+    a.sin_family = AF_INET;
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    a.sin_port = htons(port);
+    connect(s, (struct sockaddr*)&a, sizeof(a));   // best-effort; unblocks accept
+    closesocket(s);
+}
+
 void ssh_disconnect_all() {
     std::vector<std::shared_ptr<std::atomic<bool>>> copy;
     { std::lock_guard<std::mutex> lk(g_ab_m); copy = g_aborts; }
@@ -52,6 +73,9 @@ void ssh_disconnect_all() {
 void ssh_request_shutdown() {
     g_stop = true;
     ssh_disconnect_all();
+    std::vector<uint16_t> ports;
+    { std::lock_guard<std::mutex> lk(g_ports_m); ports = g_ports; }
+    for (uint16_t p : ports) poke_port(p);   // wake any accept blocked in ssh_bind_accept
 }
 
 // ---- host key ----
@@ -121,7 +145,10 @@ static std::string key_fp(ssh_key k) {
 
 struct Auth { bool ok = false; std::string fp; std::string comment; };
 
-static Auth authenticate(ssh_session s, const std::vector<AuthKey>& keys) {
+static std::mutex g_nf_m;
+static std::set<std::string> g_notified_fp;   // unknown fingerprints we already ballooned about
+
+static Auth authenticate(ssh_session s, const std::vector<AuthKey>& keys, App* app) {
     ssh_message msg;
     while (true) {
         msg = ssh_message_get(s);
@@ -137,6 +164,15 @@ static Auth authenticate(ssh_session s, const std::vector<AuthKey>& keys) {
                         ssh_message_free(msg);
                         return r;
                     }
+                }
+                // offered key matches nobody -> balloon once per fingerprint
+                std::string fp = key_fp(off);
+                bool do_notify = false;
+                { std::lock_guard<std::mutex> lk(g_nf_m);
+                  if (g_notified_fp.size() < 64 && g_notified_fp.insert(fp).second) do_notify = true; }
+                if (do_notify && app) {
+                    LOG("unknown public key rejected: %s", fp.c_str());
+                    app->request_notify(L"unknown key rejected", utf8_to_wide(fp));
                 }
             }
             ssh_message_reply_default(msg);
@@ -380,7 +416,10 @@ struct SerialBridge : std::enable_shared_from_this<SerialBridge> {
                     if (!logged) { LOG("serial %s: first data %d bytes", self->name.c_str(), n); logged = true; }
                     std::lock_guard<std::mutex> lk(self->att_m);
                     std::string chunk(b, n);
-                    for (auto& a : self->attaches) { std::lock_guard<std::mutex> ql(a->qm); a->outq.push_back(chunk); }
+                    for (auto& a : self->attaches) {
+                        std::lock_guard<std::mutex> ql(a->qm);
+                        if (a->outq.size() < 256) a->outq.push_back(chunk);   // cap: drop new if a viewer is slow
+                    }
                 } else if (n < 0) { LOG("serial %s: read error", self->name.c_str()); break; }
             }
             LOG("serial %s: reader stopped, total %ld bytes", self->name.c_str(), total);
@@ -419,19 +458,18 @@ static std::shared_ptr<SerialBridge> bridge_attach(const SerialCfg& sc, const st
 }
 
 static void bridge_release(const std::string& name, const std::shared_ptr<Attach>& a) {
-    std::shared_ptr<SerialBridge> b; bool last = false;
-    {
-        std::lock_guard<std::mutex> lk(g_bm);
-        auto it = g_bridges.find(name);
-        if (it == g_bridges.end()) return;
-        b = it->second;
-        if (--b->ref == 0) { g_bridges.erase(it); last = true; }
-    }
-    if (b) b->detach(a);
-    if (last) {
+    // stop/join/close the bridge under the lock so a concurrent attach cannot
+    // create a second bridge and fail the exclusive COM open.
+    std::lock_guard<std::mutex> lk(g_bm);
+    auto it = g_bridges.find(name);
+    if (it == g_bridges.end()) return;
+    auto b = it->second;
+    b->detach(a);
+    if (--b->ref == 0) {
         b->stop = true;
         if (b->reader.joinable()) b->reader.join();
         b->sp.close();
+        g_bridges.erase(it);
         LOG("bridge closed %s", name.c_str());
     }
 }
@@ -439,7 +477,7 @@ static void bridge_release(const std::string& name, const std::shared_ptr<Attach
 // ---- session handlers ----
 static void shell_session(ssh_session s, App* app) {
     auto keys = load_auth_keys(app->cfg.authorized_keys);
-    Auth a = authenticate(s, keys);
+    Auth a = authenticate(s, keys, app);
     free_keys(keys);
     if (!a.ok) return;
     std::string who = display_name(app, a);
@@ -458,7 +496,7 @@ static void shell_session(ssh_session s, App* app) {
 
 static void serial_session(ssh_session s, const SerialCfg sc, App* app) {
     auto keys = load_auth_keys(app->cfg.authorized_keys);
-    Auth a = authenticate(s, keys);
+    Auth a = authenticate(s, keys, app);
     free_keys(keys);
     if (!a.ok) return;
     std::string who = display_name(app, a);
@@ -469,7 +507,17 @@ static void serial_session(ssh_session s, const SerialCfg sc, App* app) {
 
     ssh_channel ch = accept_channel(s);
     if (!ch) { app->clear_busy(sc.name, tok); unreg_abort(abort); app->session_end(tok); return; }
-    wait_channel_requests(s);
+    ChanReq rq = wait_channel_requests(s);
+
+    // serial ports are interactive consoles; a remote exec makes no sense here.
+    if (rq.exec) {
+        const char* m = "remoted: serial ports are interactive-only.\r\n"
+                        "Connect without a command:  ssh -p <port> <host>\r\n";
+        ssh_channel_write(ch, m, (uint32_t)strlen(m));
+        ssh_channel_send_eof(ch); ssh_channel_close(ch); ssh_channel_free(ch);
+        app->clear_busy(sc.name, tok); unreg_abort(abort); app->session_end(tok);
+        return;
+    }
 
     std::string com = app->find_com_for(sc.name);
     if (com.empty()) {
@@ -493,14 +541,15 @@ static void serial_session(ssh_session s, const SerialCfg sc, App* app) {
                     if (r > 0) b->write_com(buf, r);
                     else if (r < 0) break;
                 }
+                // drain pending UART bytes OUTSIDE the queue lock (don't block
+                // the reader while a slow client is being written to)
+                std::vector<std::string> popped;
                 {
                     std::lock_guard<std::mutex> ql(at->qm);
-                    while (!at->outq.empty()) {
-                        const auto& ss = at->outq.front();
-                        ssh_channel_write(ch, ss.data(), (uint32_t)ss.size());
-                        at->outq.pop_front();
-                    }
+                    popped.reserve(at->outq.size());
+                    while (!at->outq.empty()) { popped.emplace_back(std::move(at->outq.front())); at->outq.pop_front(); }
                 }
+                for (const auto& ss : popped) ssh_channel_write(ch, ss.data(), (uint32_t)ss.size());
                 if (ssh_channel_is_eof(ch) || ssh_channel_is_closed(ch)) break;
                 if (avail == 0) Sleep(5);
             }
@@ -526,6 +575,7 @@ static ssh_bind make_bind(const std::string& host, uint16_t port, const std::str
         ssh_bind_free(b); return nullptr;
     }
     LOG("ssh listening on %s:%u", host.c_str(), port);
+    { std::lock_guard<std::mutex> lk(g_ports_m); g_ports.push_back(port); }
     return b;
 }
 
@@ -539,8 +589,18 @@ static void accept_loop(ssh_bind b, App* app, std::function<void(ssh_session, Ap
             Sleep(50); continue;
         }
         std::thread([s, app, fn]() {
-            if (ssh_handle_key_exchange(s) == SSH_OK) fn(s, app);
-            else LOG("kex failed: %s", ssh_get_error(s));
+            try {
+                // a silent/half-open connection will time out instead of
+                // pinning a thread forever.
+                long timeout = 60;
+                ssh_options_set(s, SSH_OPTIONS_TIMEOUT, &timeout);
+                if (ssh_handle_key_exchange(s) == SSH_OK) fn(s, app);
+                else LOG("kex failed: %s", ssh_get_error(s));
+            } catch (const std::exception& e) {
+                LOG("session exception: %s", e.what());
+            } catch (...) {
+                LOG("session unknown exception");
+            }
             ssh_disconnect(s); ssh_free(s);
         }).detach();
     }
@@ -549,13 +609,13 @@ static void accept_loop(ssh_bind b, App* app, std::function<void(ssh_session, Ap
 
 static void bind_main(App* app, std::string host, uint16_t port, std::string hostkey) {
     ssh_bind b = make_bind(host, port, hostkey);
-    if (!b) return;
+    if (!b) { app->request_notify(L"remoted", L"failed to listen on :" + std::to_wstring(port)); return; }
     accept_loop(b, app, shell_session);
 }
 
 static void bind_serial(App* app, std::string host, SerialCfg sc, std::string hostkey) {
     ssh_bind b = make_bind(host, sc.listen_port, hostkey);
-    if (!b) return;
+    if (!b) { app->request_notify(L"remoted", L"failed to listen on :" + std::to_wstring(sc.listen_port) + L" (" + utf8_to_wide(sc.name) + L")"); return; }
     accept_loop(b, app, [sc](ssh_session s, App* a) { serial_session(s, sc, a); });
 }
 
