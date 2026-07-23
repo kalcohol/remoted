@@ -1,0 +1,26 @@
+{
+  "ssh": {
+    "listen": "0.0.0.0:9721",
+    "host_key": "keys/ed25519_key",
+    "authorized_keys": "keys/authorized_keys",
+    "shell_dir": "."
+  },
+  "identities": {
+    "SHA256:REPLACE_WITH_YOUR_KEY_FINGERPRINT": {
+      "name": "张三",
+      "contact": "wx: zhang / 工位 B12"
+    }
+  },
+  "serial": [
+    { "name": "haps0", "com": "COM44", "usb_id": "7&1895985a&0&0000", "baud": 115200, "listen_port": 9722 },
+    { "name": "haps1", "com": "COM36", "usb_id": "7&1c035072&0&0000", "baud": 115200, "listen_port": 9723 },
+    { "name": "haps2", "com": "COM19", "usb_id": "7&34d013c2&0&0000", "baud": 115200, "listen_port": 9724 },
+    { "name": "haps3", "com": "COM40", "usb_id": "7&2ebd0117&0&0000", "baud": 115200, "listen_port": 9725 },
+    { "name": "host",  "com": "COM23", "usb_id": "DK0EBG2H",          "baud": 115200, "listen_port": 9726 }
+  ],
+  "overlay": {
+    "enabled": true,
+    "retract_delay_sec": 3,
+    "message": "HAPS 调试机远程占用中，请勿操作，谢谢配合"
+  }
+}

@@ -1,0 +1,26 @@
+# build / cmake
+/build/
+/out/
+/asm/
+*.user
+.vs/
+CMakeUserPresets.json
+vcpkg_installed/
+
+# runtime-generated keys & logs
+keys/*
+!keys/.gitkeep
+*.log
+
+# opencode / agent local notes
+AGENTS.md
+
+# compiled output
+*.exe
+*.dll
+*.lib
+*.exp
+*.pdb
+*.ilk
+*.obj
+*.map

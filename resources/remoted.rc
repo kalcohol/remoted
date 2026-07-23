@@ -1,0 +1,4 @@
+#include <windows.h>
+
+// application manifest (common controls v6, dpi-aware, UTF-8 codepage)
+1 RT_MANIFEST "remoted.manifest"

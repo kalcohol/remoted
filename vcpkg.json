@@ -1,0 +1,11 @@
+{
+  "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg.schema.json",
+  "name": "remoted",
+  "version": "0.1.0",
+  "description": "A tiny tray-resident SSH gateway with exclusive serial forwarding for lab hardware.",
+  "dependencies": [
+    "libssh",
+    "nlohmann-json"
+  ],
+  "builtin-baseline": "2475cc332a47b3a63bb3de58293bdab7726613ca"
+}
