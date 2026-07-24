@@ -4,8 +4,12 @@
 
 static UINT g_oemcp = 936;
 
+// Only codepages whose lead byte is 0x81..0xFE (GBK/Big5) use the DBCS
+// forward-parse below. Shift-JIS(932) has single-byte half-width katakana in
+// 0xA1..0xDF and a different lead range, so it is NOT handled here (falls back
+// to no-carry); EUC-KR(949) likewise. Rare on a Chinese lab host.
 static bool is_dbcs(UINT cp) {
-    return cp == 936 || cp == 932 || cp == 949 || cp == 950 || cp == 1361;
+    return cp == 936 || cp == 950;
 }
 
 void cp_init() {

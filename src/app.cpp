@@ -56,20 +56,24 @@ void App::session_end(int token) {
 }
 
 bool App::mark_busy(const std::string& name, int token, const std::string& holder) {
-    std::lock_guard<std::mutex> lk(m_);
-    for (auto& st : status_) {
-        if (st.name == name) { st.holders[token] = holder; break; }
+    {
+        std::lock_guard<std::mutex> lk(m_);
+        for (auto& st : status_) {
+            if (st.name == name) { st.holders[token] = holder; break; }
+        }
     }
-    if (hwnd_main) PostMessage(hwnd_main, WM_APP_STATE, 1, 0);
+    if (hwnd_main) PostMessage(hwnd_main, WM_APP_REFRESH, 0, 0);   // text-only refresh
     return true;
 }
 
 void App::clear_busy(const std::string& name, int token) {
-    std::lock_guard<std::mutex> lk(m_);
-    for (auto& st : status_) {
-        if (st.name == name) { st.holders.erase(token); break; }
+    {
+        std::lock_guard<std::mutex> lk(m_);
+        for (auto& st : status_) {
+            if (st.name == name) { st.holders.erase(token); break; }
+        }
     }
-    if (hwnd_main) PostMessage(hwnd_main, WM_APP_STATE, 1, 0);
+    if (hwnd_main) PostMessage(hwnd_main, WM_APP_REFRESH, 0, 0);
 }
 
 void App::request_notify(const std::wstring& title, const std::wstring& body) {

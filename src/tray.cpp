@@ -7,6 +7,8 @@
 #include <windows.h>
 #include <shellapi.h>
 #include <sstream>
+#include <vector>
+#include <utility>
 
 enum { IDM_STATUS = 1001, IDM_DISC, IDM_SHOW, IDM_CFG, IDM_EXIT };
 
@@ -95,13 +97,23 @@ LRESULT CALLBACK Tray::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                                    L"ssh session is up - see the tray icon.");
         return 0;
     case WM_APP_NOTIFY: {
-        if (self) {
-            std::vector<std::pair<std::wstring, std::wstring>> v;
-            { std::lock_guard<std::mutex> lk(app->nm_); v.swap(app->pending_notify_); }
-            for (auto& p : v) self->show_balloon(p.first, p.second);
+        std::vector<std::pair<std::wstring, std::wstring>> v;
+        if (app) { std::lock_guard<std::mutex> lk(app->nm_); v.swap(app->pending_notify_); }
+        if (self && !v.empty()) {
+            if (v.size() == 1) self->show_balloon(v[0].first, v[0].second);
+            else {   // multiple -> collapse (successive NIM_MODIFY would only show the last)
+                std::wstring body;
+                for (auto& p : v) { if (!body.empty()) body += L"\r\n"; body += p.second; }
+                self->show_balloon(L"remoted", body);
+            }
         }
         return 0;
     }
+    case WM_APP_REFRESH:
+        // holder list changed; refresh the overlay text only if it's already up
+        // (don't re-pop a minimized overlay on every attach/detach).
+        if (ov && IsWindowVisible(ov->hwnd())) ov->show_now();
+        return 0;
     case WM_APP_STATE: {
         int active = (int)wp;
         if (app && app->cfg.overlay.enabled && ov) {

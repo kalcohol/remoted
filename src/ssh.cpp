@@ -13,7 +13,6 @@
 #include <libssh/server.h>
 
 #include <windows.h>
-#include <jobapi.h>
 #include <ioapiset.h>
 
 #include <thread>
@@ -148,11 +147,24 @@ struct Auth { bool ok = false; std::string fp; std::string comment; };
 static std::mutex g_nf_m;
 static std::set<std::string> g_notified_fp;   // unknown fingerprints we already ballooned about
 
-static Auth authenticate(ssh_session s, const std::vector<AuthKey>& keys, App* app) {
+// Notify once per fingerprint when a session ultimately fails to authenticate.
+static void notify_unknown_key(App* app, const std::string& fp) {
+    if (!app || fp.empty()) return;
+    bool do_notify = false;
+    { std::lock_guard<std::mutex> lk(g_nf_m);
+      if (g_notified_fp.size() < 64 && g_notified_fp.insert(fp).second) do_notify = true; }
+    if (do_notify) {
+        LOG("auth failed; last offered key: %s", fp.c_str());
+        app->request_notify(L"unknown key rejected", utf8_to_wide(fp));
+    }
+}
+
+static Auth authenticate(ssh_session s, const std::vector<AuthKey>& keys) {
     ssh_message msg;
+    std::string lastFp;   // last offered (rejected) pubkey, for failure reporting
     while (true) {
         msg = ssh_message_get(s);
-        if (!msg) return {};
+        if (!msg) return { false, lastFp, "" };
         int t = ssh_message_type(msg), st = ssh_message_subtype(msg);
         if (t == SSH_REQUEST_AUTH && st == SSH_AUTH_METHOD_PUBLICKEY) {
             ssh_key off = ssh_message_auth_pubkey(msg);
@@ -165,15 +177,7 @@ static Auth authenticate(ssh_session s, const std::vector<AuthKey>& keys, App* a
                         return r;
                     }
                 }
-                // offered key matches nobody -> balloon once per fingerprint
-                std::string fp = key_fp(off);
-                bool do_notify = false;
-                { std::lock_guard<std::mutex> lk(g_nf_m);
-                  if (g_notified_fp.size() < 64 && g_notified_fp.insert(fp).second) do_notify = true; }
-                if (do_notify && app) {
-                    LOG("unknown public key rejected: %s", fp.c_str());
-                    app->request_notify(L"unknown key rejected", utf8_to_wide(fp));
-                }
+                lastFp = key_fp(off);   // remember; don't balloon per-attempt (clients try several)
             }
             ssh_message_reply_default(msg);
         } else if (t == SSH_REQUEST_AUTH) {
@@ -294,20 +298,22 @@ static void run_shell(ssh_channel ch, const AppConfig& cfg, bool exec, const std
     BOOL ok = CreateProcessW(nullptr, cl.data(), nullptr, nullptr, TRUE,
                              CREATE_NO_WINDOW, nullptr,
                              cwd.empty() ? nullptr : cwd.c_str(), &si, &pi);
-    CloseHandle(cInR); CloseHandle(cOutW); CloseHandle(pi.hThread);
+    CloseHandle(cInR); CloseHandle(cOutW);
     if (!ok) {
         const char* e = "remoted: CreateProcess failed\r\n";
         ssh_channel_write(ch, e, (uint32_t)strlen(e));
         CloseHandle(cInW); CloseHandle(cOutR);
         return;
     }
+    CloseHandle(pi.hThread);   // we don't need the thread handle
 
     // reader: child stdout (OEM) -> UTF-8 -> queue (never touches the channel)
     struct Q { std::mutex m; std::deque<std::string> q; bool eof = false; };
     auto Q_ = std::make_shared<Q>();
     auto oemCarry = std::make_shared<std::string>();
     HANDLE readEv = CreateEvent(nullptr, TRUE, FALSE, nullptr);
-    std::thread reader([cOutR, readEv, Q_, oemCarry]() {
+    HANDLE stopEv = CreateEvent(nullptr, TRUE, FALSE, nullptr);
+    std::thread reader([cOutR, readEv, stopEv, Q_, oemCarry]() {
         char b[8192]; DWORD n;
         for (;;) {
             OVERLAPPED ov{}; ov.hEvent = readEv;
@@ -315,26 +321,36 @@ static void run_shell(ssh_channel ch, const AppConfig& cfg, bool exec, const std
             BOOL ok = ReadFile(cOutR, b, sizeof b, &n, &ov);
             if (ok) { if (n == 0) break; }
             else if (GetLastError() == ERROR_IO_PENDING) {
-                WaitForSingleObject(readEv, INFINITE);
+                HANDLE hs[2] = { readEv, stopEv };
+                DWORD w = WaitForMultipleObjects(2, hs, FALSE, INFINITE);
+                if (w == WAIT_OBJECT_0 + 1) {   // stop: cancel even a freshly-pending read
+                    CancelIoEx(cOutR, &ov);
+                    DWORD got = 0; GetOverlappedResult(cOutR, &ov, &got, TRUE);
+                    break;
+                }
                 DWORD got = 0;
                 if (!GetOverlappedResult(cOutR, &ov, &got, FALSE)) break;  // cancelled / error
                 n = got;
                 if (n == 0) break;
             } else break;
             std::string s = cp_oem2utf8(b, n, *oemCarry);
-            if (!s.empty()) { std::lock_guard<std::mutex> lk(Q_->m); Q_->q.push_back(s); }
+            if (!s.empty()) {
+                std::lock_guard<std::mutex> lk(Q_->m);
+                if (Q_->q.size() < 256) Q_->q.push_back(s);   // cap: drop if the main loop is slow
+            }
         }
         std::lock_guard<std::mutex> lk(Q_->m);
         Q_->eof = true;
     });
 
     auto drain = [&]() {
-        std::lock_guard<std::mutex> lk(Q_->m);
-        while (!Q_->q.empty()) {
-            const auto& s = Q_->q.front();
-            ssh_channel_write(ch, s.data(), (uint32_t)s.size());
-            Q_->q.pop_front();
+        std::vector<std::string> popped;
+        {
+            std::lock_guard<std::mutex> lk(Q_->m);
+            popped.reserve(Q_->q.size());
+            while (!Q_->q.empty()) { popped.emplace_back(std::move(Q_->q.front())); Q_->q.pop_front(); }
         }
+        for (const auto& s : popped) ssh_channel_write(ch, s.data(), (uint32_t)s.size());   // write outside the lock
     };
 
     char buf[4096];
@@ -354,7 +370,8 @@ static void run_shell(ssh_channel ch, const AppConfig& cfg, bool exec, const std
             int r = ssh_channel_read(ch, buf, (uint32_t)rd, 0);
             if (r > 0) {
                 if (exec) {
-                    DWORD w = 0; if (cInW != INVALID_HANDLE_VALUE) WriteFile(cInW, buf, (DWORD)r, &w, nullptr);
+                    std::string oem = cp_utf82oem(buf, r, u2oCarry);   // transcode stdin too (text scripts)
+                    DWORD w = 0; if (cInW != INVALID_HANDLE_VALUE && !oem.empty()) WriteFile(cInW, oem.data(), (DWORD)oem.size(), &w, nullptr);
                 } else {
                     ssh_channel_write(ch, buf, (uint32_t)r);
                     std::string exp; exp.reserve(r + 8);
@@ -381,9 +398,11 @@ static void run_shell(ssh_channel ch, const AppConfig& cfg, bool exec, const std
         if (code == STILL_ACTIVE) code = 1;
         ssh_channel_request_send_exit_status(ch, (int)code);
     }
-    CancelIoEx(cOutR, nullptr);   // cancel any in-flight overlapped read on cOutR (any thread)
-    reader.join();                // reader's GetOverlappedResult now returns FALSE -> it exits
+    CancelIoEx(cOutR, nullptr);   // cancel any in-flight overlapped read on cOutR
+    SetEvent(stopEv);              // also wakes a read that pended AFTER the cancel
+    reader.join();
     CloseHandle(readEv);
+    CloseHandle(stopEv);
     CloseHandle(cOutR);
     CloseHandle(pi.hProcess);
 }
@@ -418,7 +437,8 @@ struct SerialBridge : std::enable_shared_from_this<SerialBridge> {
                     std::string chunk(b, n);
                     for (auto& a : self->attaches) {
                         std::lock_guard<std::mutex> ql(a->qm);
-                        if (a->outq.size() < 256) a->outq.push_back(chunk);   // cap: drop new if a viewer is slow
+                        if (a->outq.size() >= 256) a->outq.pop_front();   // drop oldest (keep newest for a live console)
+                        a->outq.push_back(chunk);
                     }
                 } else if (n < 0) { LOG("serial %s: read error", self->name.c_str()); break; }
             }
@@ -475,48 +495,51 @@ static void bridge_release(const std::string& name, const std::shared_ptr<Attach
 }
 
 // ---- session handlers ----
+// RAII: ensures occupancy (session token / abort flag / serial busy slot) is
+// released even if the handler throws or returns early.
+struct Guard { std::function<void()> d; Guard(std::function<void()> f) : d(std::move(f)) {} ~Guard() { if (d) d(); } };
+
 static void shell_session(ssh_session s, App* app) {
     auto keys = load_auth_keys(app->cfg.authorized_keys);
-    Auth a = authenticate(s, keys, app);
+    Auth a = authenticate(s, keys);
     free_keys(keys);
-    if (!a.ok) return;
+    if (!a.ok) { notify_unknown_key(app, a.fp); return; }
     std::string who = display_name(app, a);
     LOG("shell session auth ok: %s", who.c_str());
     int tok = app->session_start("shell", who);
     auto abort = reg_abort();
+    Guard g([&]() { unreg_abort(abort); app->session_end(tok); });
+
     ssh_channel ch = accept_channel(s);
-    if (!ch) { unreg_abort(abort); app->session_end(tok); return; }
+    if (!ch) return;
     ChanReq rq = wait_channel_requests(s);
-    if (!rq.exec) send_motd(ch, *app);   // banner only for interactive shells, not exec
+    if (!rq.exec) send_motd(ch, *app);
     run_shell(ch, app->cfg, rq.exec, rq.exec_cmd, abort);
     ssh_channel_send_eof(ch); ssh_channel_close(ch); ssh_channel_free(ch);
-    unreg_abort(abort);
-    app->session_end(tok);
 }
 
 static void serial_session(ssh_session s, const SerialCfg sc, App* app) {
     auto keys = load_auth_keys(app->cfg.authorized_keys);
-    Auth a = authenticate(s, keys, app);
+    Auth a = authenticate(s, keys);
     free_keys(keys);
-    if (!a.ok) return;
+    if (!a.ok) { notify_unknown_key(app, a.fp); return; }
     std::string who = display_name(app, a);
     LOG("serial session %s auth ok: %s", sc.name.c_str(), who.c_str());
     int tok = app->session_start(sc.name, who);
     auto abort = reg_abort();
     app->mark_busy(sc.name, tok, who);
+    Guard g([&]() { app->clear_busy(sc.name, tok); unreg_abort(abort); app->session_end(tok); });
 
     ssh_channel ch = accept_channel(s);
-    if (!ch) { app->clear_busy(sc.name, tok); unreg_abort(abort); app->session_end(tok); return; }
+    if (!ch) return;
     ChanReq rq = wait_channel_requests(s);
 
-    // serial ports are interactive consoles; a remote exec makes no sense here.
-    if (rq.exec) {
+    if (rq.exec) {   // serial ports are interactive consoles; exec makes no sense
         const char* m = "remoted: serial ports are interactive-only.\r\n"
                         "Connect without a command:  ssh -p <port> <host>\r\n";
         ssh_channel_write(ch, m, (uint32_t)strlen(m));
         ssh_channel_send_eof(ch); ssh_channel_close(ch); ssh_channel_free(ch);
-        app->clear_busy(sc.name, tok); unreg_abort(abort); app->session_end(tok);
-        return;
+        return;   // guard releases occupancy
     }
 
     std::string com = app->find_com_for(sc.name);
@@ -541,8 +564,6 @@ static void serial_session(ssh_session s, const SerialCfg sc, App* app) {
                     if (r > 0) b->write_com(buf, r);
                     else if (r < 0) break;
                 }
-                // drain pending UART bytes OUTSIDE the queue lock (don't block
-                // the reader while a slow client is being written to)
                 std::vector<std::string> popped;
                 {
                     std::lock_guard<std::mutex> ql(at->qm);
@@ -558,9 +579,6 @@ static void serial_session(ssh_session s, const SerialCfg sc, App* app) {
     }
 
     ssh_channel_send_eof(ch); ssh_channel_close(ch); ssh_channel_free(ch);
-    app->clear_busy(sc.name, tok);
-    unreg_abort(abort);
-    app->session_end(tok);
 }
 
 // ---- bind / accept loop ----

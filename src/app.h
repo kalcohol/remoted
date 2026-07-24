@@ -12,8 +12,9 @@
 #define WM_APP_STATE   (WM_APP + 1)   // occupancy changed -> refresh overlay
 #define WM_APP_TRAY    (WM_APP + 2)   // tray icon callback
 #define WM_APP_EXIT    (WM_APP + 3)   // request quit
-#define WM_APP_BALLOON (WM_APP + 4)   // 2nd instance asked us to re-announce
-#define WM_APP_NOTIFY  (WM_APP + 5)   // a pending balloon notification
+#define WM_APP_BALLOON  (WM_APP + 4)   // 2nd instance asked us to re-announce
+#define WM_APP_NOTIFY   (WM_APP + 5)   // a pending balloon notification
+#define WM_APP_REFRESH  (WM_APP + 6)   // refresh overlay text only if visible
 #define TIMER_RETRACT  9001
 
 struct SerialStatus {
