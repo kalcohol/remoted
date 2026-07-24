@@ -144,22 +144,58 @@ static bool write_all_ov(HANDLE h, const char* data, size_t n,
     return ok;
 }
 
+// every run_shell resource in one RAII bag: ANY exit path - normal, early
+// return, or an exception mid-flight - kills the child tree, stops and joins
+// the reader, and closes every handle. Without this, a bad_alloc halfway
+// through would leak all handles and orphan the child (job never closed ->
+// KILL_ON_JOB_CLOSE never fires).
+struct ShellRes {
+    HANDLE cInW = INVALID_HANDLE_VALUE;
+    HANDLE cOutR = INVALID_HANDLE_VALUE;
+    HANDLE readEv = nullptr, stopEv = nullptr;
+    HANDLE job = nullptr;
+    HANDLE hProcess = nullptr;
+    bool kill_on_exit = true;   // cleared only on the clean child-exited path
+    std::thread reader;
+
+    void kill_tree() {
+        if (job) TerminateJobObject(job, 1);        // kills the whole tree
+        else if (hProcess) TerminateProcess(hProcess, 1);   // job setup failed
+    }
+    ~ShellRes() {
+        if (hProcess && kill_on_exit) {
+            kill_tree();
+            WaitForSingleObject(hProcess, 3000);
+        }
+        if (stopEv) SetEvent(stopEv);   // the reader cancels its OWN pending read
+                                        // (CancelIoEx from this thread would be a
+                                        // no-op - it only cancels the caller's I/O)
+        if (reader.joinable()) reader.join();
+        if (cInW != INVALID_HANDLE_VALUE) CloseHandle(cInW);
+        if (cOutR != INVALID_HANDLE_VALUE) CloseHandle(cOutR);
+        if (readEv) CloseHandle(readEv);
+        if (stopEv) CloseHandle(stopEv);
+        if (job) CloseHandle(job);   // KILL_ON_JOB_CLOSE sweeps surviving grandchildren
+        if (hProcess) CloseHandle(hProcess);
+    }
+};
+
 // ---- child process pump (pipes + OEM<->UTF-8 transcoding) ----
 // exec: cmd /C <cmd>. interactive shell: cmd /K with local echo + \r->\r\n.
 // All ssh_channel_* calls are on this thread only; the reader pushes child
 // output (already converted to UTF-8) into a queue. The stdout read end is an
-// overlapped pipe so we can CancelIoEx it on teardown -> the reader always
-// unblocks and join() never deadlocks (even if a grandchild holds the pipe).
+// overlapped pipe so the reader always unblocks on teardown and join() never
+// deadlocks (even if a grandchild holds the pipe).
 void run_shell(ssh_channel ch, const std::string& shell_dir, bool exec, const std::string& exec_cmd,
                const std::shared_ptr<std::atomic<bool>>& abort) {
     std::wstring cmdline = exec ? (L"cmd.exe /C " + utf8_to_wide(exec_cmd)) : L"cmd.exe /K";
     std::wstring cwd = utf8_to_wide(shell_dir);
 
-    HANDLE cInR, cInW;
-    if (!make_overlapped_pipe_out(cInR, cInW)) return;
-    SetHandleInformation(cInW, HANDLE_FLAG_INHERIT, 0);
-    HANDLE cOutR, cOutW;
-    if (!make_overlapped_pipe(cOutR, cOutW)) { CloseHandle(cInR); CloseHandle(cInW); return; }
+    ShellRes R;
+    HANDLE cInR = INVALID_HANDLE_VALUE, cOutW = INVALID_HANDLE_VALUE;
+    if (!make_overlapped_pipe_out(cInR, R.cInW)) return;
+    SetHandleInformation(R.cInW, HANDLE_FLAG_INHERIT, 0);
+    if (!make_overlapped_pipe(R.cOutR, cOutW)) { CloseHandle(cInR); return; }
 
     // whitelist only the two pipe ends for inheritance: bInheritHandles=TRUE
     // would otherwise hand the child every inheritable handle in the process
@@ -203,47 +239,36 @@ void run_shell(ssh_channel ch, const std::string& shell_dir, bool exec, const st
     CloseHandle(cInR); CloseHandle(cOutW);
     if (!ok) {
         ch_write_str(ch, "remoted: CreateProcess failed\r\n");
-        CloseHandle(cInW); CloseHandle(cOutR);
         return;
     }
     CloseHandle(pi.hThread);   // we don't need the thread handle
+    R.hProcess = pi.hProcess;
 
     // kill-on-close job: teardown takes down the whole process tree -- a bare
     // TerminateProcess would orphan grandchildren (e.g. a flasher started by a
-    // batch file). If job setup fails we fall back to TerminateProcess below.
-    HANDLE job = CreateJobObjectW(nullptr, nullptr);
-    if (job) {
+    // batch file). If job setup fails we fall back to TerminateProcess.
+    R.job = CreateJobObjectW(nullptr, nullptr);
+    if (R.job) {
         JOBOBJECT_EXTENDED_LIMIT_INFORMATION jeli{};
         jeli.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-        if (!SetInformationJobObject(job, JobObjectExtendedLimitInformation, &jeli, sizeof(jeli)) ||
-            !AssignProcessToJobObject(job, pi.hProcess)) {
-            CloseHandle(job);
-            job = nullptr;
+        if (!SetInformationJobObject(R.job, JobObjectExtendedLimitInformation, &jeli, sizeof(jeli)) ||
+            !AssignProcessToJobObject(R.job, R.hProcess)) {
+            CloseHandle(R.job);
+            R.job = nullptr;
         }
     }
-    auto kill_tree = [&]() {
-        if (job) TerminateJobObject(job, 1);      // kills the whole tree
-        else TerminateProcess(pi.hProcess, 1);    // fallback if job setup failed
-    };
 
     // reader: child stdout (OEM) -> UTF-8 -> queue (never touches the channel)
     struct Q { std::mutex m; std::deque<std::string> q; bool eof = false; unsigned dropped = 0; };
     auto Q_ = std::make_shared<Q>();
     auto oemCarry = std::make_shared<std::string>();
-    HANDLE readEv = CreateEvent(nullptr, TRUE, FALSE, nullptr);
-    HANDLE stopEv = CreateEvent(nullptr, TRUE, FALSE, nullptr);
-    if (!readEv || !stopEv) {
+    R.readEv = CreateEvent(nullptr, TRUE, FALSE, nullptr);
+    R.stopEv = CreateEvent(nullptr, TRUE, FALSE, nullptr);
+    if (!R.readEv || !R.stopEv) {
         LOG("run_shell: CreateEvent failed err=%lu", GetLastError());
-        kill_tree();
-        WaitForSingleObject(pi.hProcess, 1000);
-        if (readEv) CloseHandle(readEv);
-        if (stopEv) CloseHandle(stopEv);
-        CloseHandle(cInW); CloseHandle(cOutR);
-        if (job) CloseHandle(job);
-        CloseHandle(pi.hProcess);
-        return;
+        return;   // R kills the child and cleans up
     }
-    std::thread reader([cOutR, readEv, stopEv, Q_, oemCarry]() {
+    R.reader = std::thread([cOutR = R.cOutR, readEv = R.readEv, stopEv = R.stopEv, Q_, oemCarry]() {
         char b[8192]; DWORD n;
         for (;;) {
             OVERLAPPED ov{}; ov.hEvent = readEv;
@@ -297,7 +322,7 @@ void run_shell(ssh_channel ch, const std::string& shell_dir, bool exec, const st
         if (!drain()) break;
 
         if (!stdinClosed && ssh_channel_is_eof(ch)) {
-            CloseHandle(cInW); cInW = INVALID_HANDLE_VALUE; stdinClosed = true;
+            CloseHandle(R.cInW); R.cInW = INVALID_HANDLE_VALUE; stdinClosed = true;
         }
 
         int avail = ssh_channel_poll_timeout(ch, 50, 0);
@@ -307,18 +332,18 @@ void run_shell(ssh_channel ch, const std::string& shell_dir, bool exec, const st
             if (r > 0) {
                 if (exec) {
                     std::string oem = cp_utf82oem(buf, r, u2oCarry);   // transcode stdin too (text scripts)
-                    if (cInW != INVALID_HANDLE_VALUE && !oem.empty() && !write_all_ov(cInW, oem.data(), oem.size(), abort)) {
+                    if (R.cInW != INVALID_HANDLE_VALUE && !oem.empty() && !write_all_ov(R.cInW, oem.data(), oem.size(), abort)) {
                         LOG("child stdin write failed (pipe full / broken) - closing stdin");
-                        CloseHandle(cInW); cInW = INVALID_HANDLE_VALUE; stdinClosed = true;
+                        CloseHandle(R.cInW); R.cInW = INVALID_HANDLE_VALUE; stdinClosed = true;
                     }
                 } else {
                     if (!ch_write_all(ch, buf, (size_t)r)) break;   // local echo
                     std::string exp; exp.reserve(r + 8);
                     for (int i = 0; i < r; ++i) exp += (buf[i] == '\r') ? std::string("\r\n") : std::string(1, buf[i]);
                     std::string oem = cp_utf82oem(exp.data(), exp.size(), u2oCarry);
-                    if (!oem.empty() && cInW != INVALID_HANDLE_VALUE && !write_all_ov(cInW, oem.data(), oem.size(), abort)) {
+                    if (!oem.empty() && R.cInW != INVALID_HANDLE_VALUE && !write_all_ov(R.cInW, oem.data(), oem.size(), abort)) {
                         LOG("child stdin write failed (pipe full / broken) - closing stdin");
-                        CloseHandle(cInW); cInW = INVALID_HANDLE_VALUE; stdinClosed = true;
+                        CloseHandle(R.cInW); R.cInW = INVALID_HANDLE_VALUE; stdinClosed = true;
                     }
                 }
             }
@@ -329,30 +354,22 @@ void run_shell(ssh_channel ch, const std::string& shell_dir, bool exec, const st
         if (ssh_channel_is_closed(ch)) break;
     }
 
-    if (cInW != INVALID_HANDLE_VALUE) { CloseHandle(cInW); cInW = INVALID_HANDLE_VALUE; }
-    if (abort->load() || !childDone) kill_tree();
+    if (R.cInW != INVALID_HANDLE_VALUE) { CloseHandle(R.cInW); R.cInW = INVALID_HANDLE_VALUE; }
+    R.kill_on_exit = abort->load() || !childDone;
     // if the process survives the wait (e.g. it ignored nothing but is stuck),
     // don't let it leak: kill and reap once more
-    if (WaitForSingleObject(pi.hProcess, 3000) == WAIT_TIMEOUT) {
+    if (WaitForSingleObject(R.hProcess, 3000) == WAIT_TIMEOUT) {
         LOG("child still alive after 3s wait - killing");
-        kill_tree();
-        WaitForSingleObject(pi.hProcess, 1000);
+        R.kill_tree();
+        WaitForSingleObject(R.hProcess, 1000);
     }
     if (exec) {   // only exec has a meaningful exit code (interactive shells don't)
         DWORD code = 1;
-        GetExitCodeProcess(pi.hProcess, &code);
+        GetExitCodeProcess(R.hProcess, &code);
         if (code == STILL_ACTIVE) code = 1;
         ssh_channel_request_send_exit_status(ch, (int)code);
     }
-    SetEvent(stopEv);   // wake the reader; it cancels its OWN pending read
-                        // (CancelIoEx from this thread would be a no-op -
-                        // it only cancels I/O issued by the calling thread)
-    reader.join();
-    CloseHandle(readEv);
-    CloseHandle(stopEv);
-    CloseHandle(cOutR);
-    if (job) CloseHandle(job);   // KILL_ON_JOB_CLOSE sweeps up any surviving grandchildren
-    CloseHandle(pi.hProcess);
+    // ~ShellRes does the rest: kill if flagged, stop+join the reader, close all
 }
 
 void shell_session(ssh_session s, App* app) {

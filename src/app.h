@@ -35,7 +35,9 @@ class App {
 public:
     std::string  config_path;
     std::wstring exe_dir;              // base dir for resolving relative config paths
-    HWND      hwnd_main = nullptr;     // owner window (tray) for PostMessage
+    // written once by the tray thread, read by many ssh workers -> atomic
+    // (a plain HWND read can't tear on Win64, but a data race is UB regardless)
+    std::atomic<HWND> hwnd_main{ nullptr };
 
     // load config from config_path, resolve paths, ensure the key dir exists.
     // Returns false on a parse error (defaults are in effect). Called once at
@@ -85,7 +87,7 @@ private:
     mutable std::mutex       refresh_m_; // serializes refresh() (enumeration is NOT under m_)
     mutable std::vector<EnumCom>     devs_;    // refreshed on demand by refresh()
     mutable std::mutex       m_;
-    std::atomic<int>         next_token_{1};
+    int                      next_token_ = 1;        // accessed under m_ only
     int                      active_ = 0;
     std::unordered_map<int, std::pair<std::string,std::string>> holders_;  // token -> {scope, name}
     mutable std::vector<SerialStatus> status_;

@@ -180,5 +180,13 @@ void bridge_release(const std::shared_ptr<SerialBridge>& b, const std::shared_pt
 void serial_session(ssh_session s, const SerialCfg sc, App* app);
 
 // RAII: ensures occupancy (session token / abort flag / serial busy slot) is
-// released even if the handler throws or returns early.
-struct Guard { std::function<void()> d; Guard(std::function<void()> f) : d(std::move(f)) {} ~Guard() { if (d) d(); } };
+// released even if the handler throws or returns early. The callback itself
+// must never escape an exception through the destructor (std::terminate).
+struct Guard {
+    std::function<void()> d;
+    Guard(std::function<void()> f) : d(std::move(f)) {}
+    ~Guard() noexcept {
+        try { if (d) d(); }
+        catch (...) { LOG("guard callback threw"); }
+    }
+};

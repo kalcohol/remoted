@@ -134,10 +134,10 @@ command="burn.bat 0" ssh-ed25519 AAAA... burner-bot
   main shell. Keys with a forced command are **rejected on the serial consoles**.
 - `no-pty` — pty requests from this key are refused (remoted has no real pty anyway).
 - `from="patterns"` — peer IP must match the comma-separated list; `!` negates,
-  `*`/`?` are wildcards, first match decides, no match denies. Patterns match
-  **numeric IPs only** (hostnames never match; IPv4-mapped IPv6 peers are
-  normalized to IPv4 first). CIDR (`a.b.c.d/n`) is **not** implemented and never
-  matches (fail closed — it is logged).
+  `*`/`?` are wildcards, first match decides, no match denies. IPv4 CIDR
+  (`10.0.0.0/24`) is supported; patterns otherwise match **numeric IPs only**
+  (hostnames never match; IPv4-mapped IPv6 peers are normalized to IPv4 first;
+  IPv6 CIDR is not implemented and never matches).
 - The `no-*-forwarding` family (`no-agent-forwarding`, `no-x11-forwarding`,
   `no-port-forwarding`, `restrict`, `permitopen`, `permitlisten`) is inherently
   satisfied — remoted implements no forwarding at all.

@@ -20,6 +20,21 @@ static std::string lower(std::string s) {
     return s;
 }
 
+// read a device property (size-query first): a silently truncated parent
+// string would break usb_id matching and land the user on the fallback COM
+static std::wstring read_dev_prop(HDEVINFO h, SP_DEVINFO_DATA* d, const DEVPROPKEY* key) {
+    DWORD size = 0;
+    SetupDiGetDevicePropertyW(h, d, key, nullptr, nullptr, 0, &size, 0);
+    if (size == 0) return L"";
+    std::vector<BYTE> buf(size + sizeof(wchar_t), 0);
+    DEVPROPTYPE pt = 0;
+    if (!SetupDiGetDevicePropertyW(h, d, key, &pt, buf.data(), (DWORD)buf.size(), nullptr, 0)) {
+        LOG("pnp: device property read failed err=%lu", GetLastError());
+        return L"";
+    }
+    return (const wchar_t*)buf.data();
+}
+
 std::vector<EnumCom> enumerate_com_ports() {
     std::vector<EnumCom> out;
     HDEVINFO h = SetupDiGetClassDevsW(&GUID_DEVCLASS_PORTS, nullptr, nullptr, DIGCF_PRESENT);
@@ -29,24 +44,19 @@ std::vector<EnumCom> enumerate_com_ports() {
     static const std::wregex re_com(L"\\(COM(\\d+)\\)");
 
     for (DWORD i = 0; SetupDiEnumDeviceInfo(h, i, &d); ++i) {
-        wchar_t fname[256] = {};
-        DWORD pt = 0;
-        if (!SetupDiGetDevicePropertyW(h, &d, &DEVPKEY_Device_FriendlyName,
-                &pt, (PBYTE)fname, sizeof(fname), nullptr, 0)) {
-            SetupDiGetDeviceRegistryPropertyW(h, &d, SPDRP_FRIENDLYNAME,
-                nullptr, (PBYTE)fname, sizeof(fname), nullptr);
+        std::wstring ws = read_dev_prop(h, &d, &DEVPKEY_Device_FriendlyName);
+        if (ws.empty()) {   // fallback for odd drivers
+            wchar_t fname[256] = {};
+            if (SetupDiGetDeviceRegistryPropertyW(h, &d, SPDRP_FRIENDLYNAME,
+                    nullptr, (PBYTE)fname, sizeof(fname), nullptr))
+                ws = fname;
         }
-        std::wstring ws(fname);
         std::wsmatch m;
         if (!std::regex_search(ws, m, re_com)) continue;
 
         EnumCom e;
         e.com = "COM" + wide_to_utf8(m[1].str());
-
-        wchar_t par[512] = {}; DWORD pt2 = 0;
-        SetupDiGetDevicePropertyW(h, &d, &DEVPKEY_Device_Parent,
-            &pt2, (PBYTE)par, sizeof(par), nullptr, 0);
-        e.parent = wide_to_utf8(par);
+        e.parent = wide_to_utf8(read_dev_prop(h, &d, &DEVPKEY_Device_Parent));
 
         out.push_back(e);
     }

@@ -31,13 +31,17 @@ static std::string cvt(UINT from, UINT to, const char* data, size_t n) {
     int w = MultiByteToWideChar(from, 0, data, (int)n, nullptr, 0);
     if (w <= 0) return "";
     std::wstring ws(w, 0);
-    MultiByteToWideChar(from, 0, data, (int)n, &ws[0], w);
+    int wr = MultiByteToWideChar(from, 0, data, (int)n, &ws[0], w);
+    if (wr <= 0) return "";
+    ws.resize(wr);   // don't trust the probe length blindly
     // lpDefaultChar/lpUsedDefaultChar must be NULL for CP_UTF8 (and flags=0
     // already gives the default '?' replacement for unmappable chars elsewhere)
     int m = WideCharToMultiByte(to, 0, ws.c_str(), (int)ws.size(), nullptr, 0, nullptr, nullptr);
     if (m <= 0) return "";
     std::string out(m, 0);
-    WideCharToMultiByte(to, 0, ws.c_str(), (int)ws.size(), &out[0], m, nullptr, nullptr);
+    int mr = WideCharToMultiByte(to, 0, ws.c_str(), (int)ws.size(), &out[0], m, nullptr, nullptr);
+    if (mr <= 0) return "";
+    out.resize(mr);
     return out;
 }
 

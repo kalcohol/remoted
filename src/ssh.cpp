@@ -71,7 +71,11 @@ void spawn_tracked(std::function<void()> fn) {
         t->th.detach();    // (a joinable std::thread left in a static would terminate)
         return;
     }
-    // reap finished workers so the list doesn't grow unbounded
+    // reap finished workers so the list doesn't grow unbounded. CONSTRAINT:
+    // the reaper joins while holding th_m, so a worker function must NEVER
+    // call spawn_tracked/join_tracked itself (joining from within = deadlock);
+    // joins of already-done threads return instantly, keeping this cheap even
+    // on the accept hot path.
     auto& v = S().tracked;
     for (auto it = v.begin(); it != v.end();) {
         if ((*it)->done->load() && (*it)->th.joinable()) (*it)->th.join();   // already done -> instant

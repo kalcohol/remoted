@@ -208,7 +208,8 @@ int App::session_start(const std::string& scope, const std::string& display_name
     int t = next_token_++;
     holders_[t] = { scope, display_name };
     active_++;
-    if (hwnd_main) PostMessage(hwnd_main, WM_APP_STATE, 1, 0);
+    HWND hw = hwnd_main.load(std::memory_order_acquire);
+    if (hw) PostMessage(hw, WM_APP_STATE, 1, 0);
     return t;
 }
 
@@ -220,7 +221,8 @@ void App::session_end(int token) {
         if (active_ > 0) active_--;
         zero = (active_ == 0);
     }
-    if (hwnd_main) PostMessage(hwnd_main, WM_APP_STATE, zero ? 0 : 1, 0);
+    HWND hw = hwnd_main.load(std::memory_order_acquire);
+    if (hw) PostMessage(hw, WM_APP_STATE, zero ? 0 : 1, 0);
 }
 
 int App::active_count() const {
@@ -236,7 +238,8 @@ bool App::mark_busy(const std::string& name, int token, const std::string& holde
             if (st.name == name) { st.holders[token] = holder; found = true; break; }
         }
     }
-    if (hwnd_main) PostMessage(hwnd_main, WM_APP_REFRESH, 0, 0);   // text-only refresh
+    HWND hw = hwnd_main.load(std::memory_order_acquire);
+    if (hw) PostMessage(hw, WM_APP_REFRESH, 0, 0);   // text-only refresh
     return found;   // false: serial vanished from the config while a session lives
 }
 
@@ -247,7 +250,8 @@ void App::clear_busy(const std::string& name, int token) {
             if (st.name == name) { st.holders.erase(token); break; }
         }
     }
-    if (hwnd_main) PostMessage(hwnd_main, WM_APP_REFRESH, 0, 0);
+    HWND hw = hwnd_main.load(std::memory_order_acquire);
+    if (hw) PostMessage(hw, WM_APP_REFRESH, 0, 0);
 }
 
 void App::request_notify(const std::wstring& title, const std::wstring& body) {
@@ -255,7 +259,8 @@ void App::request_notify(const std::wstring& title, const std::wstring& body) {
         std::lock_guard<std::mutex> lk(nm_);
         pending_notify_.emplace_back(title, body);
     }
-    if (hwnd_main) PostMessage(hwnd_main, WM_APP_NOTIFY, 0, 0);
+    HWND hw = hwnd_main.load(std::memory_order_acquire);
+    if (hw) PostMessage(hw, WM_APP_NOTIFY, 0, 0);
 }
 
 std::wstring App::overlay_text() const {
