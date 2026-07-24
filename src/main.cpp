@@ -40,16 +40,6 @@ static LONG WINAPI veh_handler(PEXCEPTION_POINTERS ep) {
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
-static std::string abs_path(const std::wstring& exe_dir, const std::string& p) {
-    if (p.empty()) return p;
-    if (p.size() >= 2 && p[1] == ':') return p;      // X:\...
-    if (p[0] == '\\' || p[0] == '/') return p;        // root / UNC
-    std::string d = wide_to_utf8(exe_dir);
-    if (p == ".") return d;
-    if (p.rfind("./", 0) == 0 || p.rfind(".\\", 0) == 0) return d + "\\" + p.substr(2);
-    return d + "\\" + p;
-}
-
 int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
     AddVectoredExceptionHandler(1, veh_handler);
 
@@ -83,6 +73,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
 
     App app;
     app.config_path = cfg_path;
+    app.exe_dir     = exe_dir;
     LOG("step: loading config");
     bool cfg_ok = true;
     app.cfg = load_config(cfg_path, &cfg_ok);
@@ -93,24 +84,8 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
             L"remoted config", MB_ICONWARNING);
     }
 
-    // authorized_keys: prefer the standard %USERPROFILE%\.ssh\authorized_keys
-    // if it exists and the user did not point the config elsewhere.
-    if (app.cfg.authorized_keys == "keys/authorized_keys") {
-        wchar_t profile[MAX_PATH];
-        DWORD nn = GetEnvironmentVariableW(L"USERPROFILE", profile, MAX_PATH);
-        if (nn > 0 && nn < MAX_PATH) {
-            std::wstring u = std::wstring(profile) + L"\\.ssh\\authorized_keys";
-            if (GetFileAttributesW(u.c_str()) != INVALID_FILE_ATTRIBUTES) {
-                app.cfg.authorized_keys = wide_to_utf8(u);
-                LOG("authorized_keys: using %USERPROFILE%\\.ssh\\authorized_keys");
-            }
-        }
-    }
-
-    app.cfg.host_key        = abs_path(exe_dir, app.cfg.host_key);
-    app.cfg.authorized_keys = abs_path(exe_dir, app.cfg.authorized_keys);
-    app.cfg.shell_dir       = abs_path(exe_dir, app.cfg.shell_dir);
-    LOG("authorized_keys resolved: %s", app.cfg.authorized_keys.c_str());
+    // resolve paths + authorized_keys preference (shared with App::reload)
+    resolve_config_paths(app.cfg, exe_dir);
 
     LOG("step: ensuring keys dir");
     auto kp = app.cfg.host_key.find_last_of("/\\");

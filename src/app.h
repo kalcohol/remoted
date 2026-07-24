@@ -27,14 +27,23 @@ struct SerialStatus {
 
 class Overlay;
 
+// resolve relative paths against exe_dir and apply the
+// %USERPROFILE%\.ssh\authorized_keys preference (startup and reload share this)
+void resolve_config_paths(AppConfig& c, const std::wstring& exe_dir);
+
 class App {
 public:
     AppConfig cfg;
-    std::string config_path;
+    std::string  config_path;
+    std::wstring exe_dir;              // base dir for resolving relative config paths
     HWND      hwnd_main = nullptr;     // owner window (tray) for PostMessage
     Overlay*  overlay  = nullptr;
 
     void start();                      // enumerate devices, build status table
+    void refresh() const;              // re-enumerate COM ports, rebuild status table
+    // reload config from config_path and re-apply (keeps listeners bound at startup).
+    // cfg is swapped under m_; readers of cfg are lock-free (see app.cpp).
+    void reload();
 
     std::vector<SerialStatus> snapshot() const;            // for MOTD
     std::string find_com_for(const std::string& name) const;
@@ -60,10 +69,10 @@ public:
     // build the text shown on the overlay (message + active holders)
     std::wstring overlay_text() const;
 private:
-    std::vector<EnumCom>     devs_;
+    mutable std::vector<EnumCom>     devs_;    // refreshed on demand by refresh()
     mutable std::mutex       m_;
     std::atomic<int>         next_token_{1};
     int                      active_ = 0;
     std::unordered_map<int, std::pair<std::string,std::string>> holders_;  // token -> {scope, name}
-    std::vector<SerialStatus> status_;
+    mutable std::vector<SerialStatus> status_;
 };

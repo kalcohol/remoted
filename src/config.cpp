@@ -5,6 +5,17 @@
 
 using json = nlohmann::json;
 
+// parse a port string; must be 1..65535, otherwise warn and use the fallback
+static uint16_t parse_port(const std::string& s, const char* what, uint16_t fallback) {
+    char* end = nullptr;
+    long v = std::strtol(s.c_str(), &end, 10);
+    if (s.empty() || !end || *end != '\0' || v < 1 || v > 65535) {
+        LOG("config: invalid %s port '%s' - using %u", what, s.c_str(), (unsigned)fallback);
+        return fallback;
+    }
+    return (uint16_t)v;
+}
+
 AppConfig load_config(const std::string& path, bool* ok) {
     AppConfig c;
     if (ok) *ok = true;
@@ -18,19 +29,22 @@ AppConfig load_config(const std::string& path, bool* ok) {
         return c;
     }
 
+    // any type/range error below (e.g. "baud": "115200", "serial": {...}) -> defaults
+    try {
+
     const auto& ssh = j.value("ssh", json::object());
     std::string listen = ssh.value("listen", "0.0.0.0:9721");
     if (!listen.empty() && listen[0] == '[') {            // [ipv6]:port
         auto rb = listen.find(']');
         if (rb != std::string::npos && rb + 2 < listen.size() && listen[rb + 1] == ':') {
             c.listen_host = listen.substr(1, rb - 1);
-            c.listen_port = (uint16_t)std::atoi(listen.substr(rb + 2).c_str());
+            c.listen_port = parse_port(listen.substr(rb + 2), "ssh listen", c.listen_port);
         }
     } else {
         auto pos = listen.rfind(':');
         if (pos != std::string::npos) {
             c.listen_host = listen.substr(0, pos);
-            c.listen_port = (uint16_t)std::atoi(listen.substr(pos + 1).c_str());
+            c.listen_port = parse_port(listen.substr(pos + 1), "ssh listen", c.listen_port);
         }
     }
     c.host_key        = ssh.value("host_key", c.host_key);
@@ -43,8 +57,14 @@ AppConfig load_config(const std::string& path, bool* ok) {
         sc.com         = s.value("com", "");
         sc.usb_id      = s.value("usb_id", "");
         sc.baud        = s.value("baud", 115200);
-        sc.listen_port = s.value("listen_port", (uint16_t)0);
+        int lp         = s.value("listen_port", 0);
+        if (lp < 0 || lp > 65535) {
+            LOG("config: serial '%s' listen_port %d out of range", sc.name.c_str(), lp);
+            lp = 0;   // entry is skipped below
+        }
+        sc.listen_port = (uint16_t)lp;
         if (!sc.name.empty() && sc.listen_port) c.serials.push_back(sc);
+        else LOG("config: serial '%s' skipped (no name or no listen_port)", sc.name.c_str());
     }
 
     const auto& ov = j.value("overlay", json::object());
@@ -60,6 +80,12 @@ AppConfig load_config(const std::string& path, bool* ok) {
             id.contact = it.value().value("contact", "");
             c.identities[it.key()] = id;
         }
+    }
+
+    } catch (std::exception& e) {
+        LOG("config value error: %s - using defaults", e.what());
+        if (ok) *ok = false;
+        return AppConfig{};
     }
 
     LOG("config loaded: %d serials, %d identities",
