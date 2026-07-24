@@ -182,22 +182,28 @@ static ssh_bind make_bind(const std::string& host, uint16_t port, const std::str
 }
 
 static void accept_loop(ssh_bind b, App* app, std::function<void(ssh_session, App*)> fn) {
+    int accept_fails = 0;
     while (!g_stop) {
         ssh_session s = ssh_new();
         if (!s) { Sleep(50); continue; }   // resource pressure: back off, don't spin
         if (ssh_bind_accept(b, s) != SSH_OK) {
             ssh_free(s);
             if (g_stop) break;
+            if (++accept_fails == 1 || accept_fails % 100 == 0)   // don't spin silently
+                LOG("accept failed (%d in a row): %s", accept_fails, ssh_get_error(b));
             Sleep(50); continue;
         }
+        accept_fails = 0;
         if (g_stop) { ssh_free(s); break; }   // accept woken by a shutdown poke
-        if (S().sessions.load() >= kMaxSessions) {
+        // reserve a slot atomically: a plain check-then-increment lets a burst
+        // of accepts all pass before any worker increments
+        if (S().sessions.fetch_add(1) >= kMaxSessions) {
+            S().sessions--;
             LOG("session cap (%d) reached - dropping new connection", kMaxSessions);
             ssh_disconnect(s); ssh_free(s);
             continue;
         }
         spawn_tracked([s, app, fn]() {
-            S().sessions++;
             try {
                 // a silent/half-open connection will time out instead of
                 // pinning a thread forever.

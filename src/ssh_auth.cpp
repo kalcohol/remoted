@@ -273,9 +273,11 @@ static void ip_record_success(const std::string& ip) {
     A().ip_fails.erase(ip);   // a working login resets the failure window
 }
 
-Auth authenticate(ssh_session s, const std::vector<AuthKey>& keys) {
+Auth authenticate(ssh_session s, const std::vector<AuthKey>& keys,
+                  const std::shared_ptr<std::atomic<bool>>& abort) {
     ssh_message msg;
-    std::string lastFp;   // last offered (rejected) pubkey, for failure reporting
+    std::string lastFp;        // last offered key that is NOT in authorized_keys (for reporting)
+    bool fail_counted = false; // count a failed session at most once
     const std::string ip = peer_ip(s);
     if (ip_throttled(ip)) {
         LOG("auth: %s throttled (too many recent failures) - dropping", ip.c_str());
@@ -283,17 +285,20 @@ Auth authenticate(ssh_session s, const std::vector<AuthKey>& keys) {
     }
     int budget = 32;      // hard cap on processed auth messages (brute-force protection)
     while (budget-- > 0) {
+        if (abort && abort->load()) break;   // disconnect-all / shutdown
         msg = ssh_message_get(s);
         if (!msg) break;
         int t = ssh_message_type(msg), st = ssh_message_subtype(msg);
         if (t == SSH_REQUEST_AUTH && st == SSH_AUTH_METHOD_PUBLICKEY) {
             ssh_key off = ssh_message_auth_pubkey(msg);
             if (off) {
-                bool matched = false;
+                bool in_authorized = false, matched = false;
                 for (const auto& ak : keys) {
                     if (ssh_key_cmp(off, ak.key, SSH_KEY_CMP_PUBLIC) != 0) continue;
+                    in_authorized = true;
                     // from= is part of authorization: a matching key from a
-                    // disallowed address counts as no match at all
+                    // disallowed address counts as no match at all (and is NOT
+                    // reported as an "unknown key" - the log line below suffices)
                     if (!ak.opts.from.empty() && !from_allows(ak.opts.from, ip)) {
                         LOG("auth: key '%s' not allowed from %s", ak.comment.c_str(), ip.c_str());
                         continue;
@@ -317,13 +322,14 @@ Auth authenticate(ssh_session s, const std::vector<AuthKey>& keys) {
                     default:   // WRONG / ERROR: bad signature -> slow down online guessing
                         Sleep(1000);
                         ip_record_fail(ip);
+                        fail_counted = true;
                         ssh_message_reply_default(msg);
                         break;
                     }
                     break;
                 }
                 if (!matched) {
-                    lastFp = key_fp(off);   // remember; don't balloon per-attempt (clients try several)
+                    if (!in_authorized) lastFp = key_fp(off);   // genuinely unknown key
                     ssh_message_reply_default(msg);
                 }
                 ssh_message_free(msg);
@@ -339,7 +345,7 @@ Auth authenticate(ssh_session s, const std::vector<AuthKey>& keys) {
         ssh_message_free(msg);
     }
     if (budget <= 0) LOG("auth attempt limit reached; dropping connection");
-    ip_record_fail(ip);   // every exit from here is a failed session
+    if (!fail_counted) ip_record_fail(ip);   // every exit here is a failed session
     return { false, lastFp, "" };
 }
 

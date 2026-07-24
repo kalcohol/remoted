@@ -58,7 +58,8 @@ void ensure_host_key(const std::string& path);
 std::vector<AuthKey> load_auth_keys(const std::string& path);
 void free_keys(std::vector<AuthKey>& keys);
 std::string key_fp(ssh_key k);
-Auth authenticate(ssh_session s, const std::vector<AuthKey>& keys);
+Auth authenticate(ssh_session s, const std::vector<AuthKey>& keys,
+                  const std::shared_ptr<std::atomic<bool>>& abort);
 void notify_unknown_key(App* app, const std::string& fp);
 // fingerprint -> identities map; else the key's comment; else a short key id (never "unknown").
 std::string display_name(App* app, const Auth& a);
@@ -149,7 +150,12 @@ struct SerialBridge : std::enable_shared_from_this<SerialBridge> {
     }
     std::shared_ptr<Attach> attach(ssh_channel ch) {
         auto a = std::make_shared<Attach>(); a->ch = ch;
-        std::lock_guard<std::mutex> lk(att_m); attaches.push_back(a);
+        std::lock_guard<std::mutex> lk(att_m);
+        // the reader may have died between bridge_attach's stop check and this
+        // attach (its broadcast only covers attaches made BEFORE it): a late
+        // attach must still learn the bridge is dead or it hangs forever
+        if (stop.load()) a->dead = true;
+        attaches.push_back(a);
         return a;
     }
     void detach(const std::shared_ptr<Attach>& a) {

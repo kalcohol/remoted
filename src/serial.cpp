@@ -15,21 +15,34 @@ bool SerialPort::open(const std::string& com, uint32_t baud) {
         return false;
     }
     DCB dcb{}; dcb.DCBlength = sizeof(dcb);
-    if (GetCommState(h_, &dcb)) {
-        dcb.BaudRate = baud;
-        dcb.ByteSize = 8; dcb.Parity = NOPARITY; dcb.StopBits = ONESTOPBIT;
-        dcb.fBinary = TRUE; dcb.fParity = FALSE;
-        // no flow control; drive DTR/RTS so USB-serial / MAX3232 powered off
-        // these lines actually transceive; keep null bytes (binary-safe).
-        dcb.fOutxCtsFlow = FALSE; dcb.fOutxDsrFlow = FALSE;
-        dcb.fOutX = FALSE; dcb.fInX = FALSE;
-        dcb.fDtrControl = DTR_CONTROL_ENABLE;
-        dcb.fRtsControl = RTS_CONTROL_ENABLE;
-        dcb.fNull = FALSE;
-        if (!SetCommState(h_, &dcb))
-            LOG("serial SetCommState failed %s err=%lu", com.c_str(), GetLastError());
+    if (!GetCommState(h_, &dcb)) {
+        LOG("serial GetCommState failed %s err=%lu", com.c_str(), GetLastError());
+        close();
+        return false;
     }
-    COMMTIMEOUTS to{};   // all zero: overlapped reads pend until data arrives
+    dcb.BaudRate = baud;
+    dcb.ByteSize = 8; dcb.Parity = NOPARITY; dcb.StopBits = ONESTOPBIT;
+    dcb.fBinary = TRUE; dcb.fParity = FALSE;
+    // no flow control; drive DTR/RTS so USB-serial / MAX3232 powered off
+    // these lines actually transceive; keep null bytes (binary-safe).
+    dcb.fOutxCtsFlow = FALSE; dcb.fOutxDsrFlow = FALSE;
+    dcb.fOutX = FALSE; dcb.fInX = FALSE;
+    dcb.fDtrControl = DTR_CONTROL_ENABLE;
+    dcb.fRtsControl = RTS_CONTROL_ENABLE;
+    dcb.fNull = FALSE;
+    if (!SetCommState(h_, &dcb)) {
+        // running at the driver's default settings (e.g. 9600) would produce
+        // garbage while claiming success - fail loudly instead
+        LOG("serial SetCommState failed %s err=%lu", com.c_str(), GetLastError());
+        close();
+        return false;
+    }
+    // MAXDWORD interval + zero totals: a read completes IMMEDIATELY with
+    // whatever bytes are buffered (possibly 0). All-zero would be the opposite
+    // of what we want - the IRP would wait for the FULL buffer, our 100ms poll
+    // would CancelIo every cycle and drop partially received bytes.
+    COMMTIMEOUTS to{};
+    to.ReadIntervalTimeout = MAXDWORD;
     SetCommTimeouts(h_, &to);
     PurgeComm(h_, PURGE_RXCLEAR | PURGE_TXCLEAR);
     LOG("serial opened %s @%u", com.c_str(), baud);
@@ -58,7 +71,13 @@ int SerialPort::read(void* buf, int len, DWORD timeout_ms) {
                 if (!GetOverlappedResult(h_, &ov, &got, FALSE)) ret = -1;
                 else ret = (int)got;
             }
-            else { CancelIo(h_); GetOverlappedResult(h_, &ov, &got, TRUE); ret = 0; }  // reap the canceled IRP
+            else {
+                CancelIo(h_);
+                // reap the IRP: if it completed between the timeout and the
+                // cancel, those bytes are real data - don't drop them
+                if (GetOverlappedResult(h_, &ov, &got, TRUE)) ret = (int)got;
+                else ret = 0;
+            }
         } else ret = -1;
     } else ret = (int)got;
     CloseHandle(ev);

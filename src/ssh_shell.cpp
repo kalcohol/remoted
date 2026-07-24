@@ -350,13 +350,13 @@ void run_shell(ssh_channel ch, const std::string& shell_dir, bool exec, const st
 
 void shell_session(ssh_session s, App* app) {
     auto keys = load_auth_keys(app->authorized_keys_path());
-    Auth a = authenticate(s, keys);
+    auto abort = reg_abort();   // early: covers the pre-auth phase too (disconnect-all)
+    Auth a = authenticate(s, keys, abort);
     free_keys(keys);
-    if (!a.ok) { notify_unknown_key(app, a.fp); return; }
+    if (!a.ok) { unreg_abort(abort); notify_unknown_key(app, a.fp); return; }
     std::string who = display_name(app, a);
     LOG("shell session auth ok: %s (%s)", who.c_str(), a.fp.c_str());
     int tok = app->session_start("shell", who);
-    auto abort = reg_abort();
     Guard g([&]() { unreg_abort(abort); app->session_end(tok); });
 
     ssh_channel ch = accept_channel(s);
