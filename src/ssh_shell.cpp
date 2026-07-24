@@ -5,7 +5,11 @@
 #include <cstring>
 
 ssh_channel accept_channel(ssh_session s) {
-    for (int i = 0; i < 32; ++i) {   // budget: a client must not stall us here forever
+    // message budget AND wall clock: a slow-drip client must not hold a
+    // worker slot for (budget x per-message timeout)
+    const ULONGLONG deadline = GetTickCount64() + 60000;
+    for (int i = 0; i < 32; ++i) {
+        if (GetTickCount64() >= deadline) { LOG("accept_channel: timed out"); return nullptr; }
         ssh_message msg = ssh_message_get(s);
         if (!msg) return nullptr;
         if (ssh_message_type(msg) == SSH_REQUEST_CHANNEL_OPEN &&
@@ -23,7 +27,9 @@ ssh_channel accept_channel(ssh_session s) {
 
 ChanReq wait_channel_requests(ssh_session s, bool allow_pty) {
     ChanReq r;
+    const ULONGLONG deadline = GetTickCount64() + 60000;   // same anti-drip wall clock
     for (int i = 0; i < 64 && !(r.shell || r.exec); ++i) {
+        if (GetTickCount64() >= deadline) { LOG("wait_channel_requests: timed out"); break; }
         ssh_message msg = ssh_message_get(s);
         if (!msg) break;
         if (ssh_message_type(msg) == SSH_REQUEST_CHANNEL) {
@@ -338,8 +344,9 @@ void run_shell(ssh_channel ch, const std::string& shell_dir, bool exec, const st
         if (code == STILL_ACTIVE) code = 1;
         ssh_channel_request_send_exit_status(ch, (int)code);
     }
-    CancelIoEx(cOutR, nullptr);   // cancel any in-flight overlapped read on cOutR
-    SetEvent(stopEv);              // also wakes a read that pended AFTER the cancel
+    SetEvent(stopEv);   // wake the reader; it cancels its OWN pending read
+                        // (CancelIoEx from this thread would be a no-op -
+                        // it only cancels I/O issued by the calling thread)
     reader.join();
     CloseHandle(readEv);
     CloseHandle(stopEv);
