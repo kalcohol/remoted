@@ -2,6 +2,7 @@
 #include "log.h"
 #include <fstream>
 #include <cstdlib>
+#include <set>
 #include <stdexcept>
 
 using json = nlohmann::json;
@@ -37,36 +38,55 @@ AppConfig load_config(const std::string& path, bool* ok) {
     std::string listen = ssh.value("listen", "0.0.0.0:9721");
     if (!listen.empty() && listen[0] == '[') {            // [ipv6]:port
         auto rb = listen.find(']');
-        if (rb != std::string::npos && rb + 2 < listen.size() && listen[rb + 1] == ':') {
+        if (rb != std::string::npos && rb + 1 < listen.size() && listen[rb + 1] == ':') {
             c.listen_host = listen.substr(1, rb - 1);
             c.listen_port = parse_port(listen.substr(rb + 2), "ssh listen", c.listen_port);
+        } else {
+            LOG("config: listen '%s' not in [ipv6]:port form - using defaults", listen.c_str());
         }
     } else {
         auto pos = listen.rfind(':');
         if (pos != std::string::npos) {
             c.listen_host = listen.substr(0, pos);
             c.listen_port = parse_port(listen.substr(pos + 1), "ssh listen", c.listen_port);
+        } else {
+            LOG("config: listen '%s' has no :port - using defaults", listen.c_str());
         }
     }
     c.host_key        = ssh.value("host_key", c.host_key);
     c.authorized_keys = ssh.value("authorized_keys", c.authorized_keys);
     c.shell_dir       = ssh.value("shell_dir", c.shell_dir);
 
+    std::set<std::string> seen_names;
+    std::set<int> seen_ports;
     for (auto& s : j.value("serial", json::array())) {
         try {   // one bad entry must not nuke the whole config
             SerialCfg sc;
             sc.name        = s.value("name", "");
             sc.com         = s.value("com", "");
             sc.usb_id      = s.value("usb_id", "");
-            sc.baud        = s.value("baud", 115200);
-            int lp         = s.value("listen_port", 0);
+            // read wide so narrowing can't smuggle a value past validation
+            int64_t baud   = s.value("baud", (int64_t)115200);
+            if (baud < 300 || baud > 3000000) {
+                LOG("config: serial '%s' baud %lld out of range - using 115200", sc.name.c_str(), (long long)baud);
+                baud = 115200;
+            }
+            sc.baud        = (uint32_t)baud;
+            int64_t lp     = s.value("listen_port", (int64_t)0);
             if (lp < 0 || lp > 65535) {
-                LOG("config: serial '%s' listen_port %d out of range", sc.name.c_str(), lp);
+                LOG("config: serial '%s' listen_port %lld out of range", sc.name.c_str(), (long long)lp);
                 lp = 0;   // entry is skipped below
             }
             sc.listen_port = (uint16_t)lp;
-            if (!sc.name.empty() && sc.listen_port) c.serials.push_back(sc);
-            else LOG("config: serial '%s' skipped (no name or no listen_port)", sc.name.c_str());
+            if (!sc.name.empty() && sc.listen_port) {
+                if (!seen_names.insert(sc.name).second)
+                    LOG("config: duplicate serial name '%s' - later entry wins for status/bridge", sc.name.c_str());
+                if (!seen_ports.insert(sc.listen_port).second)
+                    LOG("config: duplicate listen_port %d (serial '%s') - second bind will fail", (int)sc.listen_port, sc.name.c_str());
+                c.serials.push_back(sc);
+            } else {
+                LOG("config: serial '%s' skipped (no name or no listen_port)", sc.name.c_str());
+            }
         } catch (std::exception& e) {
             LOG("config: bad serial entry skipped: %s", e.what());
         }

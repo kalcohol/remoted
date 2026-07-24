@@ -19,9 +19,9 @@ itself is opened exclusively) + the occupancy prompt.
   `ssh haps0` drops you straight on the UART console. COM ports are matched by a **stable
   USB parent id** (falls back to the COM number) and opened **exclusively**; multiple SSH
   sessions may attach to the same console at once — all see the output and all can type.
-- **Occupancy overlay** — any connection triggers a topmost full-screen prompt ("occupied by
-  X, please Love & Peace"); retracts a few seconds after the *last* connection drops.
-  Minimize / disconnect-all from the overlay or tray. Closes to the system tray.
+- **Occupancy overlay** — any *authenticated* session triggers a topmost full-screen prompt
+  ("occupied by X, please Love & Peace"); retracts a few seconds after the *last* session
+  drops. Minimize / disconnect-all from the overlay or tray. Closes to the system tray.
 - **No auto-start**, no service. Run it once (e.g. over VNC); it stays in the tray.
 
 ```
@@ -38,7 +38,8 @@ control machine                       lab PC (domain Win10)
 
 ### Prerequisites
 - Visual Studio 2026 BuildTools (MSVC) — or any VS with the C++ workload.
-- CMake ≥ 3.21.
+- CMake ≥ 4.2 (the `Visual Studio 18 2026` generator was added in 4.2; older CMake
+  works if you swap in an older generator in `CMakePresets.json`).
 - **vcpkg**, as a real **git checkout** with `VCPKG_ROOT` pointing at it.
 
 > **vcpkg gotcha:** the vcpkg bundled inside Visual Studio (`<VS>\VC\vcpkg`) is a non-git
@@ -67,8 +68,13 @@ Output: `build\Release\remoted.exe` (+ copied `ssh.dll`, `libcrypto-3-x64.dll`).
    ssh-keygen -t ed25519 -f %USERPROFILE%\.ssh\remoted_key
    ```
 4. Append the public key into `C:\remoted\keys\authorized_keys` on the lab PC.
-5. Get the key's fingerprint (remoted logs the full SHA256 fingerprint on every connect —
-   successful or not — so you can copy it from `remoted.log`, or):
+   > **Priority gotcha:** while `authorized_keys` stays at its default
+   > (`keys/authorized_keys`) and `%USERPROFILE%\.ssh\authorized_keys` exists, the
+   > **profile file wins** (OpenSSH convention — it is logged at startup). Either put
+   > your keys there, or point `ssh.authorized_keys` at an explicit path.
+5. Get the key's fingerprint. On successful auth the full SHA256 fingerprint is always
+   in `remoted.log`; on failed auth the last offered fingerprint is logged once per
+   unique key (plus a tray balloon). Or locally:
    ```bat
    ssh-keygen -lf %USERPROFILE%\.ssh\remoted_key.pub
    ```
@@ -123,15 +129,18 @@ command="burn.bat 0" ssh-ed25519 AAAA... burner-bot
   main shell. Keys with a forced command are **rejected on the serial consoles**.
 - `no-pty` — pty requests from this key are refused (remoted has no real pty anyway).
 - `from="patterns"` — peer IP must match the comma-separated list; `!` negates,
-  `*`/`?` are wildcards, first match decides, no match denies. CIDR (`a.b.c.d/n`) is
-  **not** implemented and never matches (fail closed — it is logged).
+  `*`/`?` are wildcards, first match decides, no match denies. Patterns match
+  **numeric IPs only** (hostnames never match; IPv4-mapped IPv6 peers are
+  normalized to IPv4 first). CIDR (`a.b.c.d/n`) is **not** implemented and never
+  matches (fail closed — it is logged).
 - The `no-*-forwarding` family (`no-agent-forwarding`, `no-x11-forwarding`,
   `no-port-forwarding`, `restrict`, `permitopen`, `permitlisten`) is inherently
   satisfied — remoted implements no forwarding at all.
 - Any other option is **ignored and logged** at connect time — do not rely on it.
 
-Failed sessions are throttled per source IP: more than 10 failures within 60 s gets
-new connections from that address dropped early, and a bad signature costs a 1 s delay.
+Failed sessions are throttled per source IP: 10 failures within 60 s gets new
+connections from that address dropped early (a successful login resets the counter),
+and a bad signature costs a 1 s delay. Concurrent sessions are capped at 64.
 
 ## Usage
 
@@ -168,17 +177,22 @@ ssh haps0                 # directly on the haps0 UART console (own listener por
 
 ## Tray / overlay
 
-- Any ssh connection shows the overlay; it retracts `retract_delay_sec` after the last
-  connection ends.
+- Any authenticated session shows the overlay; it retracts `retract_delay_sec` after the
+  last session ends.
 - Tray menu: **Status**, **Disconnect all remote**, **Show overlay**, **Edit config** (opens
   `remoted.json` in notepad), **Reload config**, **Exit**.
-  Reload applies changes to `identities` / `overlay` / `serial` / `authorized_keys`
-  immediately; changing a `listen` port requires restarting the process.
+  Reload applies `identities` / `overlay` / `authorized_keys` / `shell_dir` immediately.
+  For `serial` entries, `com` / `usb_id` / `baud` apply to *new* sessions — a console
+  already in use keeps its current device until all its sessions disconnect (attaching
+  with changed settings is refused while the old bridge lives). New or changed
+  `listen_port`s (main or serial) require restarting the process; a parse failure keeps
+  the previous config and says so in a balloon.
 - Overlay buttons: **Disconnect remote** (kills all ssh sessions), **Minimize** (hide overlay
   only). It is a courtesy prompt, not a hard lock.
 
 ## Logs
-`remoted.log` is written next to the exe.
+`remoted.log` is written next to the exe (rotated at 1 MB to `remoted.log.old`).
+Fatal crashes append one line to `remoted.crash.log` (exception code + address).
 
 ## License
 MIT.

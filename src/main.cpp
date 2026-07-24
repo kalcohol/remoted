@@ -12,6 +12,9 @@
 #include <string>
 
 // ---- crash capture: vectored exception handler writes a crash log ----
+// NOTE: this runs in exception context - snprintf/CreateFile are not strictly
+// async-safe (a crash while holding a CRT/heap lock could deadlock the handler
+// itself). Worst case we lose the crash log; it never makes the crash worse.
 static wchar_t g_crashlog[MAX_PATH] = L"";
 
 static LONG WINAPI veh_handler(PEXCEPTION_POINTERS ep) {
@@ -44,7 +47,11 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
     AddVectoredExceptionHandler(1, veh_handler);
 
     wchar_t exe[MAX_PATH];
-    GetModuleFileNameW(nullptr, exe, MAX_PATH);
+    DWORD exe_len = GetModuleFileNameW(nullptr, exe, MAX_PATH);
+    if (exe_len == 0 || exe_len >= MAX_PATH) {   // 0 = error; MAX_PATH = truncated
+        MessageBoxW(nullptr, L"cannot resolve exe path (too long?)", L"remoted", MB_ICONERROR);
+        return 1;
+    }
     std::wstring exe_path(exe);
     auto slash = exe_path.find_last_of(L"\\/");
     std::wstring exe_dir = (slash != std::wstring::npos) ? exe_path.substr(0, slash) : exe_path;
@@ -97,7 +104,6 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
     Overlay overlay;
     LOG("step: creating overlay");
     if (!overlay.create(app, hInst)) { LOG("overlay create FAILED"); }
-    app->overlay = &overlay;
 
     Tray tray;
     LOG("step: creating tray");
@@ -118,6 +124,10 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
 
     LOG("step: entering message loop");
     int ret = tray.loop();
+    // every exit path funnels here (menu Exit, WM_CLOSE/taskkill, GetMessage
+    // error): stop the ssh side so no worker outlives the process teardown.
+    // safe to call twice (IDM_EXIT already did): it is idempotent.
+    ssh_request_shutdown();
     LOG("remoted exiting (code %d)", ret);
     return ret;
 

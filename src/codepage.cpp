@@ -32,11 +32,12 @@ static std::string cvt(UINT from, UINT to, const char* data, size_t n) {
     if (w <= 0) return "";
     std::wstring ws(w, 0);
     MultiByteToWideChar(from, 0, data, (int)n, &ws[0], w);
-    BOOL used = FALSE;
-    int m = WideCharToMultiByte(to, 0, ws.c_str(), (int)ws.size(), nullptr, 0, nullptr, &used);
+    // lpDefaultChar/lpUsedDefaultChar must be NULL for CP_UTF8 (and flags=0
+    // already gives the default '?' replacement for unmappable chars elsewhere)
+    int m = WideCharToMultiByte(to, 0, ws.c_str(), (int)ws.size(), nullptr, 0, nullptr, nullptr);
     if (m <= 0) return "";
     std::string out(m, 0);
-    WideCharToMultiByte(to, 0, ws.c_str(), (int)ws.size(), &out[0], m, nullptr, &used);
+    WideCharToMultiByte(to, 0, ws.c_str(), (int)ws.size(), &out[0], m, nullptr, nullptr);
     return out;
 }
 

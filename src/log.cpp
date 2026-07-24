@@ -2,18 +2,27 @@
 #include <windows.h>
 #include <cstdarg>
 #include <cstdio>
+#include <cstring>
 #include <mutex>
 
-static std::wstring g_path;
-static std::mutex   g_m;
-static HANDLE       g_h = INVALID_HANDLE_VALUE;   // kept open between lines
+// leaked on purpose: a shutdown straggler may still LOG while the CRT destroys
+// statics - a leaked object outlives them all (the OS reclaims the handle).
+namespace {
+struct LogStatics {
+    std::wstring path;
+    std::mutex   m;
+    HANDLE       h = INVALID_HANDLE_VALUE;   // kept open between lines
+    ULONGLONG    last_rotate_warn = 0;
+};
+}
+static LogStatics& L() { static auto* p = new LogStatics(); return *p; }
 
-void log_init(const std::wstring& p) { g_path = p; }
+void log_init(const std::wstring& p) { L().path = p; }
 
-// (called under g_m) open the log on first use, rotate past 1 MB.
+// (called under L().m) open the log on first use, rotate past 1 MB.
 static HANDLE log_handle() {
     auto open_fresh = []() {
-        HANDLE h = CreateFileW(g_path.c_str(), FILE_APPEND_DATA,
+        HANDLE h = CreateFileW(L().path.c_str(), FILE_APPEND_DATA,
                                FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
                                OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
         if (h != INVALID_HANDLE_VALUE) {
@@ -22,17 +31,32 @@ static HANDLE log_handle() {
         }
         return h;
     };
-    if (g_h == INVALID_HANDLE_VALUE) g_h = open_fresh();
-    if (g_h == INVALID_HANDLE_VALUE) return g_h;
+    if (L().h == INVALID_HANDLE_VALUE) L().h = open_fresh();
+    if (L().h == INVALID_HANDLE_VALUE) return L().h;
 
     LARGE_INTEGER sz{};
-    if (GetFileSizeEx(g_h, &sz) && sz.QuadPart > 1024 * 1024) {
-        CloseHandle(g_h); g_h = INVALID_HANDLE_VALUE;
-        std::wstring old = g_path + L".old";
-        MoveFileExW(g_path.c_str(), old.c_str(), MOVEFILE_REPLACE_EXISTING);
-        g_h = open_fresh();
+    if (GetFileSizeEx(L().h, &sz) && sz.QuadPart > 1024 * 1024) {
+        CloseHandle(L().h); L().h = INVALID_HANDLE_VALUE;
+        std::wstring old = L().path + L".old";
+        if (MoveFileExW(L().path.c_str(), old.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+            L().h = open_fresh();
+        } else {
+            // someone else holds the file: keep appending to the big one, but
+            // say so (rate-limited) instead of silently growing forever
+            ULONGLONG now = GetTickCount64();
+            if (now - L().last_rotate_warn > 60000) {
+                L().last_rotate_warn = now;
+                L().h = open_fresh();
+                if (L().h != INVALID_HANDLE_VALUE) {
+                    const char* m = "log rotation failed (remoted.log held by another process?)\n";
+                    DWORD w = 0; WriteFile(L().h, m, (DWORD)strlen(m), &w, nullptr);
+                }
+            } else {
+                L().h = open_fresh();
+            }
+        }
     }
-    return g_h;
+    return L().h;
 }
 
 void log_line(const char* fmt, ...) {
@@ -54,8 +78,8 @@ void log_line(const char* fmt, ...) {
 
     OutputDebugStringA(line);
 
-    std::lock_guard<std::mutex> lk(g_m);
-    if (g_path.empty()) return;
+    std::lock_guard<std::mutex> lk(L().m);
+    if (L().path.empty()) return;
 
     HANDLE h = log_handle();
     if (h != INVALID_HANDLE_VALUE) {

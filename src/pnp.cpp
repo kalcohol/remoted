@@ -8,6 +8,7 @@
 #include <regex>
 #include <algorithm>
 #include <cctype>
+#include <mutex>
 
 // {4d36e978-e325-11ce-bfc1-08002be10318}  Ports class
 static const GUID GUID_DEVCLASS_PORTS = {
@@ -48,9 +49,22 @@ std::vector<EnumCom> enumerate_com_ports() {
         e.parent = wide_to_utf8(par);
 
         out.push_back(e);
-        LOG("enum: %-7s parent=%s", e.com.c_str(), e.parent.c_str());
     }
     SetupDiDestroyDeviceInfoList(h);
+
+    // this runs on every status query / connection: only log when the set
+    // actually changes, or routine MOTDs bury real diagnostics
+    static std::mutex* cache_m = new std::mutex();                            // leaked: exit-safe
+    static std::vector<std::string>* prev = new std::vector<std::string>();
+    std::vector<std::string> cur;
+    for (const auto& e : out) cur.push_back(e.com + "|" + e.parent);
+    {
+        std::lock_guard<std::mutex> lk(*cache_m);
+        if (cur != *prev) {
+            for (const auto& e : out) LOG("enum: %-7s parent=%s", e.com.c_str(), e.parent.c_str());
+            *prev = std::move(cur);
+        }
+    }
     return out;
 }
 

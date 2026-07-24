@@ -20,6 +20,11 @@ static LRESULT CALLBACK OverlayProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         if (LOWORD(wp) == IDC_DISC) { LOG("disconnect-all requested via overlay button"); ssh_disconnect_all(); }
         else if (LOWORD(wp) == IDC_MIN) { ShowWindow(h, SW_HIDE); }
         return 0;
+    case WM_CLOSE:
+        // DefWindowProc would DestroyWindow here (e.g. Alt+F4) and leave every
+        // stored HWND dangling; the overlay is a reusable prompt -> hide instead
+        ShowWindow(h, SW_HIDE);
+        return 0;
     case WM_ERASEBKGND: {
         RECT rc; GetClientRect(h, &rc);
         FillRect((HDC)wp, &rc, self ? self->brush() : (HBRUSH)GetStockObject(BLACK_BRUSH));
@@ -36,10 +41,16 @@ Overlay::~Overlay() {
     if (brush_) DeleteObject(brush_);
 }
 
+// font heights / layout constants are designed at 96 DPI; scale for the
+// monitor the window is on (manifest declares PerMonitorV2)
+static int dpi_scale(int v) {
+    return MulDiv(v, GetDpiForSystem(), 96);
+}
+
 bool Overlay::create(App* app, HINSTANCE hi) {
     app_ = app; inst_ = hi;
     brush_ = CreateSolidBrush(RGB(0, 0, 0));
-    font_  = CreateFontW(28, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
+    font_  = CreateFontW(dpi_scale(28), 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
                          DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
                          CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
                          FF_DONTCARE, L"Segoe UI");
@@ -62,7 +73,7 @@ bool Overlay::create(App* app, HINSTANCE hi) {
                              0, 0, 100, 50, hwnd_, (HMENU)200, hi, nullptr);
     SendMessageW(htext_, WM_SETFONT, (WPARAM)font_, TRUE);
 
-    btnfont_ = CreateFontW(20, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+    btnfont_ = CreateFontW(dpi_scale(20), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
                            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
                            CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
                            FF_DONTCARE, L"Segoe UI");
@@ -79,13 +90,13 @@ bool Overlay::create(App* app, HINSTANCE hi) {
 }
 
 void Overlay::layout(int w, int h) {
-    int btnw = 220, btnh = 48, gap = 20;
-    int by = h - btnh - 60;
+    int btnw = dpi_scale(220), btnh = dpi_scale(48), gap = dpi_scale(20);
+    int by = h - btnh - dpi_scale(60);
     int totalw = btnw * 2 + gap;
     int bx = (w - totalw) / 2;
     MoveWindow(hdisc_, bx, by, btnw, btnh, TRUE);
     MoveWindow(hmin_,  bx + btnw + gap, by, btnw, btnh, TRUE);
-    MoveWindow(htext_, w / 10, by - 280, w - w / 5, 260, TRUE);
+    MoveWindow(htext_, w / 10, by - dpi_scale(280), w - w / 5, dpi_scale(260), TRUE);
 }
 
 void Overlay::show_now() {
@@ -96,7 +107,7 @@ void Overlay::show_now() {
     int h = GetSystemMetrics(SM_CYVIRTUALSCREEN);
     MoveWindow(hwnd_, x, y, w, h, TRUE);
     layout(w, h);
-    ShowWindow(hwnd_, SW_SHOWNORMAL);
+    ShowWindow(hwnd_, SW_SHOWNA);   // show WITHOUT stealing focus
     SetWindowPos(hwnd_, HWND_TOPMOST, 0, 0, 0, 0,
                  SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE);
 }
