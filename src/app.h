@@ -36,7 +36,6 @@ public:
     std::string  config_path;
     std::wstring exe_dir;              // base dir for resolving relative config paths
     HWND      hwnd_main = nullptr;     // owner window (tray) for PostMessage
-    Overlay*  overlay  = nullptr;
 
     // load config from config_path, resolve paths, ensure the key dir exists.
     // Returns false on a parse error (defaults are in effect). Called once at
@@ -45,7 +44,8 @@ public:
     void start();                      // enumerate devices, build status table
     void refresh() const;              // re-enumerate COM ports, rebuild status table
     // reload config from config_path and re-apply (keeps listeners bound at startup).
-    void reload();
+    // Returns false (and KEEPS the old config) when the file fails to parse.
+    bool reload();
 
     // thread-safe config accessors: cfg_ is swapped under m_ by reload(), so
     // every reader goes through one of these (each returns a copy under m_).
@@ -56,6 +56,7 @@ public:
     std::string shell_dir() const;
     OverlayCfg  overlay_cfg() const;
     std::vector<SerialCfg> serial_cfgs() const;
+    bool serial_cfg_for(const std::string& name, SerialCfg& out) const;
     bool identity_for(const std::string& fp, Identity& out) const;
 
     std::vector<SerialStatus> snapshot() const;            // for MOTD
@@ -65,6 +66,7 @@ public:
     // scope = "shell" (main shell user) or the serial name.
     int  session_start(const std::string& scope, const std::string& display_name);
     void session_end(int token);
+    int  active_count() const;         // live session count (UI reads this, not msg payloads)
     std::vector<std::string> shell_holders() const;
 
     // serial hold registry (status only; sharing is handled by the ssh layer).

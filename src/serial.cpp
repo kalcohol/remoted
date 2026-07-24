@@ -52,7 +52,12 @@ int SerialPort::read(void* buf, int len, DWORD timeout_ms) {
         DWORD e = GetLastError();
         if (e == ERROR_IO_PENDING) {
             DWORD r = WaitForSingleObject(ev, timeout_ms);
-            if (r == WAIT_OBJECT_0) { GetOverlappedResult(h_, &ov, &got, FALSE); ret = (int)got; }
+            if (r == WAIT_OBJECT_0) {
+                // device yanked mid-read completes the IRP with an ERROR - the
+                // event still signals, so check the result, not just the wait
+                if (!GetOverlappedResult(h_, &ov, &got, FALSE)) ret = -1;
+                else ret = (int)got;
+            }
             else { CancelIo(h_); GetOverlappedResult(h_, &ov, &got, TRUE); ret = 0; }  // reap the canceled IRP
         } else ret = -1;
     } else ret = (int)got;
@@ -72,9 +77,11 @@ int SerialPort::write(const void* buf, int len) {
         DWORD e = GetLastError();
         if (e == ERROR_IO_PENDING) {
             DWORD r = WaitForSingleObject(ev, 2000);
-            if (r == WAIT_OBJECT_0) { GetOverlappedResult(h_, &ov, &wrote, FALSE); }
-            else { CancelIo(h_); GetOverlappedResult(h_, &ov, &wrote, TRUE); LOG("serial write timeout (%d bytes)", len); }
-            ret = (int)wrote;
+            if (r == WAIT_OBJECT_0) {
+                if (!GetOverlappedResult(h_, &ov, &wrote, FALSE)) ret = -1;
+                else ret = (int)wrote;
+            }
+            else { CancelIo(h_); GetOverlappedResult(h_, &ov, &wrote, TRUE); LOG("serial write timeout (%d bytes)", len); ret = (int)wrote; }
         } else ret = -1;
     } else ret = (int)wrote;
     CloseHandle(ev);

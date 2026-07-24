@@ -72,6 +72,17 @@ inline void ch_write_str(ssh_channel ch, const std::string& s) {
         LOG("channel write failed (%zu bytes)", s.size());
 }
 
+// channel write that loops over short writes; false = channel is broken
+inline bool ch_write_all(ssh_channel ch, const char* d, size_t n) {
+    size_t off = 0;
+    while (off < n) {
+        int w = ssh_channel_write(ch, d + off, (uint32_t)(n - off));
+        if (w <= 0) return false;
+        off += (size_t)w;
+    }
+    return true;
+}
+
 // ---- channel/session helpers (ssh_shell.cpp) ----
 ssh_channel accept_channel(ssh_session s);
 
@@ -90,7 +101,8 @@ struct Attach {
     ssh_channel ch;
     std::mutex qm;
     std::deque<std::string> outq;
-    unsigned dropped = 0;   // chunks dropped because outq was full (rate-limited logging)
+    unsigned dropped = 0;            // chunks dropped because outq was full (rate-limited logging)
+    std::atomic<bool> dead{ false }; // bridge's reader died (device gone) -> session should bail
 };
 
 struct SerialBridge : std::enable_shared_from_this<SerialBridge> {
@@ -126,6 +138,12 @@ struct SerialBridge : std::enable_shared_from_this<SerialBridge> {
                     }
                 } else if (n < 0) { LOG("serial %s: read error", self->name.c_str()); break; }
             }
+            // reader is gone (device error or stop): mark the bridge dead and tell
+            // every attached session, so nobody sits on a silent console and no
+            // new session gets attached to a dead bridge (see bridge_attach)
+            self->stop = true;
+            { std::lock_guard<std::mutex> lk(self->att_m);
+              for (auto& a : self->attaches) a->dead = true; }
             LOG("serial %s: reader stopped, total %ld bytes", self->name.c_str(), total);
         });
     }
@@ -140,12 +158,14 @@ struct SerialBridge : std::enable_shared_from_this<SerialBridge> {
     }
     void write_com(const void* buf, int len) {
         std::lock_guard<std::mutex> lk(write_m);
-        sp.write(buf, len);
+        int w = sp.write(buf, len);
+        if (w != len) LOG("serial %s: short/failed write (%d/%d bytes)", name.c_str(), w, len);
     }
 };
 
 std::shared_ptr<SerialBridge> bridge_attach(const SerialCfg& sc, const std::string& com);
-void bridge_release(const std::string& name, const std::shared_ptr<Attach>& a);
+// identity-checked: a stale release from a dead bridge can't touch the current one
+void bridge_release(const std::shared_ptr<SerialBridge>& b, const std::shared_ptr<Attach>& a);
 
 void serial_session(ssh_session s, const SerialCfg sc, App* app);
 

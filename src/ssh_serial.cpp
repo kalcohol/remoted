@@ -9,7 +9,29 @@ static std::map<std::string, std::shared_ptr<SerialBridge>> g_bridges;
 std::shared_ptr<SerialBridge> bridge_attach(const SerialCfg& sc, const std::string& com) {
     std::lock_guard<std::mutex> lk(g_bm);
     auto it = g_bridges.find(sc.name);
-    if (it != g_bridges.end()) { it->second->ref++; return it->second; }
+    if (it != g_bridges.end()) {
+        auto b = it->second;
+        if (b->stop.load()) {
+            // dead bridge (reader died with the device): tear it down and fall
+            // through to build a fresh one. Old attaches were flagged dead by the
+            // reader's exit broadcast; their sessions unwind via bridge_release,
+            // which is identity-checked and won't touch the new bridge.
+            LOG("bridge %s: previous bridge died - rebuilding", sc.name.c_str());
+            if (b->reader.joinable()) b->reader.join();
+            b->sp.close();
+            g_bridges.erase(it);
+        } else {
+            if (b->com != com || b->baud != sc.baud) {
+                // config changed under a live bridge: refuse rather than silently
+                // land the user on the OLD device / baud
+                LOG("bridge %s: config changed (%s@%u -> %s@%u) while in use - refusing attach",
+                    sc.name.c_str(), b->com.c_str(), b->baud, com.c_str(), sc.baud);
+                return nullptr;
+            }
+            b->ref++;
+            return b;
+        }
+    }
     auto b = std::make_shared<SerialBridge>();
     b->name = sc.name; b->com = com; b->baud = sc.baud;
     if (!b->sp.open(com, sc.baud)) { LOG("bridge open failed %s (%s)", sc.name.c_str(), com.c_str()); return nullptr; }
@@ -20,20 +42,19 @@ std::shared_ptr<SerialBridge> bridge_attach(const SerialCfg& sc, const std::stri
     return b;
 }
 
-void bridge_release(const std::string& name, const std::shared_ptr<Attach>& a) {
-    // stop/join/close the bridge under the lock so a concurrent attach cannot
-    // create a second bridge and fail the exclusive COM open.
+void bridge_release(const std::shared_ptr<SerialBridge>& b, const std::shared_ptr<Attach>& a) {
+    // stop/join/close under the lock so a concurrent attach cannot create a
+    // second bridge and fail the exclusive COM open. Identity-checked: a stale
+    // release from a previous (dead) bridge must not touch the current one.
     std::lock_guard<std::mutex> lk(g_bm);
-    auto it = g_bridges.find(name);
-    if (it == g_bridges.end()) return;
-    auto b = it->second;
     b->detach(a);
     if (--b->ref == 0) {
+        auto it = g_bridges.find(b->name);
+        if (it != g_bridges.end() && it->second == b) g_bridges.erase(it);
         b->stop = true;
         if (b->reader.joinable()) b->reader.join();
         b->sp.close();
-        g_bridges.erase(it);
-        LOG("bridge closed %s", name.c_str());
+        LOG("bridge closed %s", b->name.c_str());
     }
 }
 
@@ -66,18 +87,31 @@ void serial_session(ssh_session s, const SerialCfg sc, App* app) {
         return;   // guard releases occupancy
     }
 
+    // use the CURRENT config entry for this serial (reload may have changed
+    // com/usb_id/baud since this listener was bound)
+    SerialCfg cur;
+    if (!app->serial_cfg_for(sc.name, cur)) {
+        ch_write_str(ch, "remoted: this serial was removed from the config\r\n");
+        ssh_channel_send_eof(ch); ssh_channel_close(ch); ssh_channel_free(ch);
+        return;
+    }
+
     std::string com = app->find_com_for(sc.name);
     if (com.empty()) {
         ch_write_str(ch, "remoted: serial port not present on this host\r\n");
     } else {
-        auto b = bridge_attach(sc, com);
+        auto b = bridge_attach(cur, com);
         if (!b) {
-            ch_write_str(ch, "remoted: cannot open serial port\r\n");
+            ch_write_str(ch, "remoted: cannot open serial port (absent, busy, or config changed while in use)\r\n");
         } else {
             auto at = b->attach(ch);
             char buf[4096];
             while (true) {
                 if (abort->load()) break;
+                if (at->dead.load()) {   // device lost / reader died
+                    ch_write_str(ch, "\r\nremoted: serial device lost - closing console\r\n");
+                    break;
+                }
                 int avail = ssh_channel_poll(ch, 0);
                 if (avail < 0) break;
                 if (avail > 0) {
@@ -94,12 +128,12 @@ void serial_session(ssh_session s, const SerialCfg sc, App* app) {
                 }
                 bool dead = false;
                 for (const auto& ss : popped)
-                    if (ssh_channel_write(ch, ss.data(), (uint32_t)ss.size()) < 0) { dead = true; break; }
+                    if (!ch_write_all(ch, ss.data(), ss.size())) { dead = true; break; }
                 if (dead) break;
                 if (ssh_channel_is_eof(ch) || ssh_channel_is_closed(ch)) break;
                 if (avail == 0) Sleep(5);
             }
-            bridge_release(sc.name, at);
+            bridge_release(b, at);
         }
     }
 

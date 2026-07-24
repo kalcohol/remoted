@@ -45,8 +45,7 @@ bool App::init() {
     // make sure the host key's parent directory exists (first run)
     std::string hk = host_key_path();
     auto kp = hk.find_last_of("/\\");
-    if (kp != std::string::npos)
-        CreateDirectoryW(utf8_to_wide(hk.substr(0, kp)).c_str(), nullptr);
+    if (kp != std::string::npos) ensure_dir(hk.substr(0, kp));
     return ok;
 }
 
@@ -94,10 +93,15 @@ std::string App::find_com_for(const std::string& name) const {
     return "";
 }
 
-void App::reload() {
+bool App::reload() {
     bool ok = true;
     AppConfig c = load_config(config_path, &ok);
-    if (!ok) LOG("reload: %s failed to parse - using defaults", config_path.c_str());
+    if (!ok) {
+        // keep the known-good config: swapping in defaults would silently
+        // change the auth surface (authorized_keys path, identities, serials)
+        LOG("reload: %s failed to parse - keeping the previous config", config_path.c_str());
+        return false;
+    }
     resolve_config_paths(c, exe_dir);
     {
         std::lock_guard<std::mutex> lk(m_);
@@ -132,6 +136,7 @@ void App::reload() {
             (int)cfg_.serials.size(), (int)cfg_.identities.size());
     }
     refresh();   // rebuild the status table for the new serial list
+    return true;
 }
 
 // ---- thread-safe config accessors (copies taken under m_) ----
@@ -164,6 +169,12 @@ std::vector<SerialCfg> App::serial_cfgs() const {
     std::lock_guard<std::mutex> lk(m_);
     return cfg_.serials;
 }
+bool App::serial_cfg_for(const std::string& name, SerialCfg& out) const {
+    std::lock_guard<std::mutex> lk(m_);
+    for (const auto& s : cfg_.serials)
+        if (s.name == name) { out = s; return true; }
+    return false;
+}
 bool App::identity_for(const std::string& fp, Identity& out) const {
     std::lock_guard<std::mutex> lk(m_);
     auto it = cfg_.identities.find(fp);
@@ -192,15 +203,21 @@ void App::session_end(int token) {
     if (hwnd_main) PostMessage(hwnd_main, WM_APP_STATE, zero ? 0 : 1, 0);
 }
 
+int App::active_count() const {
+    std::lock_guard<std::mutex> lk(m_);
+    return active_;
+}
+
 bool App::mark_busy(const std::string& name, int token, const std::string& holder) {
+    bool found = false;
     {
         std::lock_guard<std::mutex> lk(m_);
         for (auto& st : status_) {
-            if (st.name == name) { st.holders[token] = holder; break; }
+            if (st.name == name) { st.holders[token] = holder; found = true; break; }
         }
     }
     if (hwnd_main) PostMessage(hwnd_main, WM_APP_REFRESH, 0, 0);   // text-only refresh
-    return true;
+    return found;   // false: serial vanished from the config while a session lives
 }
 
 void App::clear_busy(const std::string& name, int token) {
