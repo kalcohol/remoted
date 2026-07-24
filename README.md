@@ -6,8 +6,8 @@ SSH, and shows a friendly **full-screen "occupied" overlay** whenever anyone is 
 
 It is deliberately HAPS-agnostic: how to burn / reset / flash is entirely up to whoever
 deploys it — they drop their own `.bat` / scripts into the shell directory and run them
-over `ssh`. remoted only provides the SSH channel + exclusive serial forwarding + the
-occupancy prompt.
+over `ssh`. remoted only provides the SSH channel + shared serial consoles (the COM port
+itself is opened exclusively) + the occupancy prompt.
 
 ## What it does
 
@@ -17,7 +17,8 @@ occupancy prompt.
   `ssh haps "burn.bat"` "just works".
 - **Serial forwarding** — each configured COM port gets its **own SSH listener port**, so
   `ssh haps0` drops you straight on the UART console. COM ports are matched by a **stable
-  USB parent id** (falls back to the COM number) and opened **exclusively**.
+  USB parent id** (falls back to the COM number) and opened **exclusively**; multiple SSH
+  sessions may attach to the same console at once — all see the output and all can type.
 - **Occupancy overlay** — any connection triggers a topmost full-screen prompt ("occupied by
   X, please Love & Peace"); retracts a few seconds after the *last* connection drops.
   Minimize / disconnect-all from the overlay or tray. Closes to the system tray.
@@ -28,7 +29,7 @@ control machine                       lab PC (domain Win10)
 ┌──────────────┐   ssh (key, no pw)  ┌────────────────────────────┐
 │ ssh haps     │ ───── :9721 ──────▶ │ remoted.exe (tray)          │
 │ ssh haps0    │                     │  libssh : main + per-serial │
-│ MobaXterm    │                     │  COM → exclusive bridge      │
+│ MobaXterm    │                     │  COM → shared console        │
 │ agent        │                     │  overlay + tray              │
 └──────────────┘                     └────────────────────────────┘
 ```
@@ -66,7 +67,8 @@ Output: `build\Release\remoted.exe` (+ copied `ssh.dll`, `libcrypto-3-x64.dll`).
    ssh-keygen -t ed25519 -f %USERPROFILE%\.ssh\remoted_key
    ```
 4. Append the public key into `C:\remoted\keys\authorized_keys` on the lab PC.
-5. Get the key's fingerprint (remoted logs it on first connect, or):
+5. Get the key's fingerprint (remoted logs the full SHA256 fingerprint on every connect —
+   successful or not — so you can copy it from `remoted.log`, or):
    ```bat
    ssh-keygen -lf %USERPROFILE%\.ssh\remoted_key.pub
    ```
@@ -134,6 +136,10 @@ ssh haps0                 # directly on the haps0 UART console (own listener por
 > Each serial is its own ssh listener port (see `.ssh/config` `Host haps0`), so
 > `ssh haps0` is the way to reach a UART. Do **not** use `ssh haps -t haps0` —
 > that would just run `cmd /C haps0` on the main shell.
+>
+> Note: if several people connect to the same serial port at once they share one console —
+> everyone sees the same output and each person's keystrokes go to the UART, so input is
+> visible to (and can conflict with) the other sessions.
 `ssh haps` prints a **banner** listing every serial, its port, and status (`[ready]` /
 `[in-use <holder>]` / `[absent]`).
 
@@ -142,7 +148,9 @@ ssh haps0                 # directly on the haps0 UART console (own listener por
 - Any ssh connection shows the overlay; it retracts `retract_delay_sec` after the last
   connection ends.
 - Tray menu: **Status**, **Disconnect all remote**, **Show overlay**, **Edit config** (opens
-  `remoted.json` in notepad), **Exit**.
+  `remoted.json` in notepad), **Reload config**, **Exit**.
+  Reload applies changes to `identities` / `overlay` / `serial` / `authorized_keys`
+  immediately; changing a `listen` port requires restarting the process.
 - Overlay buttons: **Disconnect remote** (kills all ssh sessions), **Minimize** (hide overlay
   only). It is a courtesy prompt, not a hard lock.
 

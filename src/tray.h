@@ -11,8 +11,6 @@ class Tray {
 public:
     bool create(App* app, Overlay* overlay, HINSTANCE hInst);
     int  loop();          // GetMessage/DispatchMessage; returns on WM_QUIT
-    void quit();
-    void notify_unknown_key(const std::string& fp);   // balloon hint
     void show_balloon(const std::wstring& title, const std::wstring& body);
     static LRESULT CALLBACK WndProc(HWND, UINT, WPARAM, LPARAM);
 private:

@@ -12,7 +12,6 @@ public:
     HWND hwnd() const { return hwnd_; }
     HBRUSH brush() const { return brush_; }
 private:
-    static LRESULT CALLBACK WndProc(HWND, UINT, WPARAM, LPARAM);
     void layout(int w, int h);
     HWND      hwnd_  = nullptr;
     HWND      htext_ = nullptr;

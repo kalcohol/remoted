@@ -10,7 +10,7 @@
 #include <vector>
 #include <utility>
 
-enum { IDM_STATUS = 1001, IDM_DISC, IDM_SHOW, IDM_CFG, IDM_EXIT };
+enum { IDM_STATUS = 1001, IDM_DISC, IDM_SHOW, IDM_CFG, IDM_RELOAD, IDM_EXIT };
 
 static HICON load_icon() {
     HICON icon = nullptr;
@@ -70,17 +70,6 @@ int Tray::loop() {
     return (int)msg.wParam;
 }
 
-void Tray::quit() { PostQuitMessage(0); }
-
-void Tray::notify_unknown_key(const std::string& fp) {
-    nid_.dwInfoFlags = NIIF_INFO;
-    wcscpy_s(nid_.szInfo,    L"unknown public key connected");
-    std::wstring w = utf8_to_wide(fp);
-    wcsncpy_s(nid_.szInfoTitle, w.c_str(), _TRUNCATE);
-    nid_.uTimeout = 8000;
-    Shell_NotifyIconW(NIM_MODIFY, &nid_);
-}
-
 LRESULT CALLBACK Tray::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     Tray* self = (Tray*)GetWindowLongPtrW(h, GWLP_USERDATA);
     App* app = self ? self->app_ : nullptr;
@@ -118,7 +107,12 @@ LRESULT CALLBACK Tray::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         int active = (int)wp;
         if (app && app->cfg.overlay.enabled && ov) {
             if (active > 0) { ov->show_now(); KillTimer(h, TIMER_RETRACT); }
-            else SetTimer(h, TIMER_RETRACT, app->cfg.overlay.retract_delay_sec * 1000, nullptr);
+            else {
+                // clamp: 0 / negative would make the retract timer misbehave
+                int d = app->cfg.overlay.retract_delay_sec;
+                if (d < 1) d = 3;
+                SetTimer(h, TIMER_RETRACT, d * 1000, nullptr);
+            }
         }
         return 0;
     }
@@ -135,7 +129,8 @@ LRESULT CALLBACK Tray::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             AppendMenuW(m, MF_STRING, IDM_DISC,  L"Disconnect all remote");
             AppendMenuW(m, MF_STRING, IDM_SHOW,  L"Show overlay");
             AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
-            AppendMenuW(m, MF_STRING, IDM_CFG,   L"Edit config");
+            AppendMenuW(m, MF_STRING, IDM_CFG,    L"Edit config");
+            AppendMenuW(m, MF_STRING, IDM_RELOAD, L"Reload config");
             AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
             AppendMenuW(m, MF_STRING, IDM_EXIT,  L"Exit");
             POINT pt; GetCursorPos(&pt);
@@ -181,6 +176,10 @@ LRESULT CALLBACK Tray::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             ShellExecuteW(h, L"open", L"notepad.exe", p.c_str(), nullptr, SW_SHOWNORMAL);
             break;
         }
+        case IDM_RELOAD:
+            app->reload();
+            self->show_balloon(L"remoted", L"config reloaded (listen port changes need restart)");
+            break;
         case IDM_EXIT:
             Shell_NotifyIconW(NIM_DELETE, &self->nid_);
             ssh_request_shutdown();   // stop accept loops + drop sessions cleanly

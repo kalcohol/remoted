@@ -29,10 +29,6 @@ static LRESULT CALLBACK OverlayProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     return DefWindowProcW(h, msg, wp, lp);
 }
 
-LRESULT CALLBACK Overlay::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
-    return OverlayProc(h, msg, wp, lp);
-}
-
 bool Overlay::create(App* app, HINSTANCE hi) {
     app_ = app; inst_ = hi;
     brush_ = CreateSolidBrush(RGB(0, 0, 0));
@@ -42,7 +38,7 @@ bool Overlay::create(App* app, HINSTANCE hi) {
                          FF_DONTCARE, L"Segoe UI");
 
     WNDCLASSW wc{};
-    wc.lpfnWndProc   = Overlay::WndProc;
+    wc.lpfnWndProc   = OverlayProc;
     wc.hInstance     = hi;
     wc.lpszClassName = L"remoted_overlay";
     wc.hCursor       = LoadCursor(nullptr, IDC_ARROW);
