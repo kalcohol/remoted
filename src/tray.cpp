@@ -201,7 +201,8 @@ LRESULT CALLBACK Tray::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             ssh_disconnect_all();
             break;
         case IDM_SHOW:
-            if (ov) ov->show_now();
+            if (ov && ov->hwnd()) ov->show_now();
+            else self->show_balloon(L"remoted", L"overlay unavailable (creation failed at startup)");
             break;
         case IDM_CFG: {
             std::wstring p = utf8_to_wide(app->config_path);

@@ -103,7 +103,12 @@ Output: `build\Release\remoted.exe` (+ copied `ssh.dll`, `libcrypto-3-x64.dll`).
 ```
 Relative paths resolve against the exe folder. `serial[].usb_id` is matched as a substring
 against the device's **USB parent id** (stable per physical port); if it does not match the
-`com` field is used instead. Any number of serial entries.
+`com` field is used instead. Any number of serial entries — names must be unique (a
+duplicate name is ignored after the first entry, with a log line).
+
+> Keys and the host key live under the exe folder with inherited ACLs. On machines
+> where other people can log in, restrict the folder to your account + SYSTEM
+> (`icacls C:\remoted /inheritance:r /grant:r "%USERNAME%:F" "SYSTEM:F"`).
 
 ### Finding the USB parent id of a COM port
 Run on the lab PC:

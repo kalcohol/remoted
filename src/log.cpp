@@ -36,23 +36,21 @@ static HANDLE log_handle() {
 
     LARGE_INTEGER sz{};
     if (GetFileSizeEx(L().h, &sz) && sz.QuadPart > 1024 * 1024) {
-        CloseHandle(L().h); L().h = INVALID_HANDLE_VALUE;
-        std::wstring old = L().path + L".old";
-        if (MoveFileExW(L().path.c_str(), old.c_str(), MOVEFILE_REPLACE_EXISTING)) {
-            L().h = open_fresh();
-        } else {
-            // someone else holds the file: keep appending to the big one, but
-            // say so (rate-limited) instead of silently growing forever
-            ULONGLONG now = GetTickCount64();
-            if (now - L().last_rotate_warn > 60000) {
-                L().last_rotate_warn = now;
+        ULONGLONG now = GetTickCount64();
+        // rate-limit the whole rotation ATTEMPT (not just the warning): when the
+        // file is held by another process every retry is a wasted close+move+open
+        if (now - L().last_rotate_warn > 60000) {
+            L().last_rotate_warn = now;
+            CloseHandle(L().h); L().h = INVALID_HANDLE_VALUE;
+            std::wstring old = L().path + L".old";
+            if (MoveFileExW(L().path.c_str(), old.c_str(), MOVEFILE_REPLACE_EXISTING)) {
                 L().h = open_fresh();
+            } else {
+                L().h = open_fresh();   // keep appending to the big one, but say so
                 if (L().h != INVALID_HANDLE_VALUE) {
                     const char* m = "log rotation failed (remoted.log held by another process?)\n";
                     DWORD w = 0; WriteFile(L().h, m, (DWORD)strlen(m), &w, nullptr);
                 }
-            } else {
-                L().h = open_fresh();
             }
         }
     }

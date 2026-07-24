@@ -79,8 +79,13 @@ AppConfig load_config(const std::string& path, bool* ok) {
             }
             sc.listen_port = (uint16_t)lp;
             if (!sc.name.empty() && sc.listen_port) {
-                if (!seen_names.insert(sc.name).second)
-                    LOG("config: duplicate serial name '%s' - later entry wins for status/bridge", sc.name.c_str());
+                if (!seen_names.insert(sc.name).second) {
+                    // every lookup is first-match-wins and the bridge keys by name:
+                    // a later duplicate would silently serve the FIRST entry's
+                    // device - refuse it instead of surprising the operator
+                    LOG("config: duplicate serial name '%s' - later entry ignored", sc.name.c_str());
+                    continue;
+                }
                 if (!seen_ports.insert(sc.listen_port).second)
                     LOG("config: duplicate listen_port %d (serial '%s') - second bind will fail", (int)sc.listen_port, sc.name.c_str());
                 c.serials.push_back(sc);

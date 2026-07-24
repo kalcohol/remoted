@@ -54,9 +54,10 @@ void App::start() {
 }
 
 void App::refresh() const {
-    auto devs = enumerate_com_ports();
+    // serialize the WHOLE refresh: concurrent refreshers (UI timer vs ssh
+    // worker) must not let an older enumeration overwrite a newer rebuild
     std::lock_guard<std::mutex> lk(m_);
-    devs_ = std::move(devs);
+    devs_ = enumerate_com_ports();
     std::vector<SerialStatus> rebuilt;
     for (const auto& s : cfg_.serials) {
         SerialStatus st;
@@ -112,16 +113,20 @@ bool App::reload() {
             c.listen_host = cfg_.listen_host;
             c.listen_port = cfg_.listen_port;
         }
-        for (const auto& ns : c.serials) {
+        for (auto& ns : c.serials) {
             const SerialCfg* old = nullptr;
             for (const auto& os : cfg_.serials)
                 if (os.name == ns.name) { old = &os; break; }
-            if (!old)
+            if (!old) {
                 LOG("reload: serial '%s' is new - listen port changes require restart",
                     ns.name.c_str());
-            else if (old->listen_port != ns.listen_port)
-                LOG("reload: serial '%s' listen port changes require restart",
-                    ns.name.c_str());
+            } else if (old->listen_port != ns.listen_port) {
+                LOG("reload: serial '%s' listen port changes require restart - keeping :%u",
+                    ns.name.c_str(), (unsigned)old->listen_port);
+                // keep the port that is actually bound, or the MOTD/Status would
+                // advertise a listener that does not exist
+                ns.listen_port = old->listen_port;
+            }
         }
         for (const auto& os : cfg_.serials) {
             bool gone = true;
