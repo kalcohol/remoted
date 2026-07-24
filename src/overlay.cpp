@@ -29,6 +29,13 @@ static LRESULT CALLBACK OverlayProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     return DefWindowProcW(h, msg, wp, lp);
 }
 
+Overlay::~Overlay() {
+    if (hwnd_) DestroyWindow(hwnd_);
+    if (font_) DeleteObject(font_);
+    if (btnfont_) DeleteObject(btnfont_);
+    if (brush_) DeleteObject(brush_);
+}
+
 bool Overlay::create(App* app, HINSTANCE hi) {
     app_ = app; inst_ = hi;
     brush_ = CreateSolidBrush(RGB(0, 0, 0));
@@ -55,18 +62,18 @@ bool Overlay::create(App* app, HINSTANCE hi) {
                              0, 0, 100, 50, hwnd_, (HMENU)200, hi, nullptr);
     SendMessageW(htext_, WM_SETFONT, (WPARAM)font_, TRUE);
 
-    HFONT btnfont = CreateFontW(20, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-                                DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
-                                CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
-                                FF_DONTCARE, L"Segoe UI");
+    btnfont_ = CreateFontW(20, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+                           DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
+                           CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+                           FF_DONTCARE, L"Segoe UI");
     hdisc_ = CreateWindowExW(0, L"BUTTON", L"Disconnect remote",
                              WS_CHILD | WS_VISIBLE, 0, 0, 200, 44,
                              hwnd_, (HMENU)IDC_DISC, hi, nullptr);
     hmin_  = CreateWindowExW(0, L"BUTTON", L"Minimize",
                              WS_CHILD | WS_VISIBLE, 0, 0, 160, 44,
                              hwnd_, (HMENU)IDC_MIN, hi, nullptr);
-    SendMessageW(hdisc_, WM_SETFONT, (WPARAM)btnfont, TRUE);
-    SendMessageW(hmin_,  WM_SETFONT, (WPARAM)btnfont, TRUE);
+    SendMessageW(hdisc_, WM_SETFONT, (WPARAM)btnfont_, TRUE);
+    SendMessageW(hmin_,  WM_SETFONT, (WPARAM)btnfont_, TRUE);
 
     return true;
 }

@@ -43,6 +43,7 @@ void SerialPort::close() {
 int SerialPort::read(void* buf, int len, DWORD timeout_ms) {
     if (!ok()) return -1;
     HANDLE ev = CreateEvent(nullptr, TRUE, FALSE, nullptr);
+    if (!ev) { LOG("serial: CreateEvent failed err=%lu", GetLastError()); return -1; }
     OVERLAPPED ov{}; ov.hEvent = ev;
     DWORD got = 0;
     BOOL ok = ReadFile(h_, buf, (DWORD)len, &got, &ov);
@@ -62,6 +63,7 @@ int SerialPort::read(void* buf, int len, DWORD timeout_ms) {
 int SerialPort::write(const void* buf, int len) {
     if (!ok() || len <= 0) return 0;
     HANDLE ev = CreateEvent(nullptr, TRUE, FALSE, nullptr);
+    if (!ev) { LOG("serial: CreateEvent failed err=%lu", GetLastError()); return -1; }
     OVERLAPPED ov{}; ov.hEvent = ev;
     DWORD wrote = 0;
     BOOL ok = WriteFile(h_, buf, (DWORD)len, &wrote, &ov);
