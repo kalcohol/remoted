@@ -1,10 +1,11 @@
 #include "ssh_internal.h"
 
 #include <ioapiset.h>
+#include <objbase.h>
 #include <cstring>
 
 ssh_channel accept_channel(ssh_session s) {
-    while (true) {
+    for (int i = 0; i < 32; ++i) {   // budget: a client must not stall us here forever
         ssh_message msg = ssh_message_get(s);
         if (!msg) return nullptr;
         if (ssh_message_type(msg) == SSH_REQUEST_CHANNEL_OPEN &&
@@ -16,6 +17,8 @@ ssh_channel accept_channel(ssh_session s) {
         ssh_message_reply_default(msg);
         ssh_message_free(msg);
     }
+    LOG("accept_channel: request budget exhausted - dropping");
+    return nullptr;
 }
 
 ChanReq wait_channel_requests(ssh_session s, bool allow_pty) {
@@ -63,13 +66,21 @@ void send_motd(ssh_channel ch, App& app) {
     ch_write_str(ch, m);
 }
 
+// unguessable pipe name (a predictable name would let any same-user process
+// connect as the pipe client and inject data into the shell's output stream)
+static std::wstring pipe_name() {
+    GUID g{};
+    CoCreateGuid(&g);
+    wchar_t buf[48] = {};
+    StringFromGUID2(g, buf, 48);
+    return L"\\\\.\\pipe\\remoted_" + std::wstring(buf);
+}
+
 // anonymous pipe whose READ end is overlapped, so CancelIoEx can cancel a
 // blocked read on teardown (closing a handle does NOT cancel in-flight sync I/O,
 // and a synchronous pipe read can't otherwise be interrupted).
-static std::atomic<unsigned> g_pipe_seq{0};
 static bool make_overlapped_pipe(HANDLE& rd, HANDLE& wr) {
-    std::wstring name = L"\\\\.\\pipe\\remoted_anon_" + std::to_wstring(GetCurrentProcessId())
-                        + L"_" + std::to_wstring(g_pipe_seq.fetch_add(1));
+    std::wstring name = pipe_name();
     rd = CreateNamedPipeW(name.c_str(), PIPE_ACCESS_INBOUND | FILE_FLAG_OVERLAPPED,
                           PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT, 1, 8192, 8192, 0, nullptr);
     if (rd == INVALID_HANDLE_VALUE) return false;
@@ -79,15 +90,52 @@ static bool make_overlapped_pipe(HANDLE& rd, HANDLE& wr) {
     return true;
 }
 
-// WriteFile to a pipe may short-write; loop until everything is in.
-static bool write_all(HANDLE h, const char* data, size_t n) {
-    size_t off = 0;
-    while (off < n) {
-        DWORD w = 0;
-        if (!WriteFile(h, data + off, (DWORD)(n - off), &w, nullptr) || w == 0) return false;
-        off += w;
-    }
+// same idea for the child's stdin: OUR write end is overlapped, so a child that
+// stops reading can't pin the session in a blocking WriteFile. The child's read
+// end is a plain synchronous handle.
+static bool make_overlapped_pipe_out(HANDLE& rd, HANDLE& wr) {
+    std::wstring name = pipe_name();
+    wr = CreateNamedPipeW(name.c_str(), PIPE_ACCESS_OUTBOUND | FILE_FLAG_OVERLAPPED,
+                          PIPE_TYPE_BYTE | PIPE_WAIT, 1, 8192, 8192, 0, nullptr);
+    if (wr == INVALID_HANDLE_VALUE) return false;
+    SECURITY_ATTRIBUTES sa{ sizeof(sa), nullptr, TRUE };
+    rd = CreateFileW(name.c_str(), GENERIC_READ, 0, &sa, OPEN_EXISTING, 0, nullptr);
+    if (rd == INVALID_HANDLE_VALUE) { CloseHandle(wr); wr = INVALID_HANDLE_VALUE; return false; }
     return true;
+}
+
+// bounded overlapped write to child stdin; polls abort while the pipe is full
+// and gives up after 3s, so teardown always stays responsive
+static bool write_all_ov(HANDLE h, const char* data, size_t n,
+                         const std::shared_ptr<std::atomic<bool>>& abort) {
+    HANDLE ev = CreateEvent(nullptr, TRUE, FALSE, nullptr);
+    if (!ev) { LOG("write_all_ov: CreateEvent failed err=%lu", GetLastError()); return false; }
+    size_t off = 0;
+    bool ok = true;
+    while (ok && off < n) {
+        OVERLAPPED ov{}; ov.hEvent = ev;
+        ResetEvent(ev);
+        DWORD w = 0;
+        if (!WriteFile(h, data + off, (DWORD)(n - off), &w, &ov)) {
+            if (GetLastError() != ERROR_IO_PENDING) { ok = false; break; }
+            ULONGLONG t0 = GetTickCount64();
+            for (;;) {
+                if (WaitForSingleObject(ev, 100) == WAIT_OBJECT_0) break;
+                if (abort->load() || GetTickCount64() - t0 > 3000) {
+                    CancelIoEx(h, &ov);
+                    DWORD tmp = 0; GetOverlappedResult(h, &ov, &tmp, TRUE);   // reap
+                    ok = false;
+                    break;
+                }
+            }
+            if (!ok) break;
+            if (!GetOverlappedResult(h, &ov, &w, FALSE)) { ok = false; break; }
+        }
+        if (w == 0) ok = false;
+        else off += w;
+    }
+    CloseHandle(ev);
+    return ok;
 }
 
 // ---- child process pump (pipes + OEM<->UTF-8 transcoding) ----
@@ -101,21 +149,51 @@ void run_shell(ssh_channel ch, const std::string& shell_dir, bool exec, const st
     std::wstring cmdline = exec ? (L"cmd.exe /C " + utf8_to_wide(exec_cmd)) : L"cmd.exe /K";
     std::wstring cwd = utf8_to_wide(shell_dir);
 
-    SECURITY_ATTRIBUTES sa{ sizeof(sa), nullptr, TRUE };
     HANDLE cInR, cInW;
-    if (!CreatePipe(&cInR, &cInW, &sa, 0)) return;
+    if (!make_overlapped_pipe_out(cInR, cInW)) return;
     SetHandleInformation(cInW, HANDLE_FLAG_INHERIT, 0);
     HANDLE cOutR, cOutW;
     if (!make_overlapped_pipe(cOutR, cOutW)) { CloseHandle(cInR); CloseHandle(cInW); return; }
 
-    STARTUPINFOW si{}; si.cb = sizeof(si);
-    si.dwFlags = STARTF_USESTDHANDLES;
-    si.hStdInput = cInR; si.hStdOutput = cOutW; si.hStdError = cOutW;
+    // whitelist only the two pipe ends for inheritance: bInheritHandles=TRUE
+    // would otherwise hand the child every inheritable handle in the process
+    // (other sessions' pipes, listen/session sockets...)
     PROCESS_INFORMATION pi{};
-    std::vector<wchar_t> cl(cmdline.begin(), cmdline.end()); cl.push_back(0);
-    BOOL ok = CreateProcessW(nullptr, cl.data(), nullptr, nullptr, TRUE,
-                             CREATE_NO_WINDOW, nullptr,
-                             cwd.empty() ? nullptr : cwd.c_str(), &si, &pi);
+    HANDLE inherit_list[2] = { cInR, cOutW };
+    SIZE_T alen = 0;
+    InitializeProcThreadAttributeList(nullptr, 1, 0, &alen);   // alen query (fails by design)
+    std::vector<BYTE> abuf(alen);
+    auto alist = (LPPROC_THREAD_ATTRIBUTE_LIST)abuf.data();
+    STARTUPINFOEXW six{};
+    BOOL ok = FALSE;
+    bool used_ex = false;
+    if (alen && InitializeProcThreadAttributeList(alist, 1, 0, &alen)) {
+        if (UpdateProcThreadAttribute(alist, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+                                      inherit_list, sizeof(inherit_list), nullptr, nullptr)) {
+            used_ex = true;
+            six.StartupInfo.cb = sizeof(six);
+            six.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+            six.StartupInfo.hStdInput = cInR;
+            six.StartupInfo.hStdOutput = cOutW;
+            six.StartupInfo.hStdError = cOutW;
+            six.lpAttributeList = alist;
+            std::vector<wchar_t> cl(cmdline.begin(), cmdline.end()); cl.push_back(0);
+            ok = CreateProcessW(nullptr, cl.data(), nullptr, nullptr, TRUE,
+                                EXTENDED_STARTUPINFO_PRESENT | CREATE_NO_WINDOW, nullptr,
+                                cwd.empty() ? nullptr : cwd.c_str(), &six.StartupInfo, &pi);
+        }
+        DeleteProcThreadAttributeList(alist);
+    }
+    if (!used_ex) {   // attribute lists unavailable (shouldn't happen on Win10): legacy path
+        LOG("proc attribute list unavailable - falling back to full handle inheritance");
+        STARTUPINFOW si{}; si.cb = sizeof(si);
+        si.dwFlags = STARTF_USESTDHANDLES;
+        si.hStdInput = cInR; si.hStdOutput = cOutW; si.hStdError = cOutW;
+        std::vector<wchar_t> cl(cmdline.begin(), cmdline.end()); cl.push_back(0);
+        ok = CreateProcessW(nullptr, cl.data(), nullptr, nullptr, TRUE,
+                            CREATE_NO_WINDOW, nullptr,
+                            cwd.empty() ? nullptr : cwd.c_str(), &si, &pi);
+    }
     CloseHandle(cInR); CloseHandle(cOutW);
     if (!ok) {
         ch_write_str(ch, "remoted: CreateProcess failed\r\n");
@@ -148,6 +226,17 @@ void run_shell(ssh_channel ch, const std::string& shell_dir, bool exec, const st
     auto oemCarry = std::make_shared<std::string>();
     HANDLE readEv = CreateEvent(nullptr, TRUE, FALSE, nullptr);
     HANDLE stopEv = CreateEvent(nullptr, TRUE, FALSE, nullptr);
+    if (!readEv || !stopEv) {
+        LOG("run_shell: CreateEvent failed err=%lu", GetLastError());
+        kill_tree();
+        WaitForSingleObject(pi.hProcess, 1000);
+        if (readEv) CloseHandle(readEv);
+        if (stopEv) CloseHandle(stopEv);
+        CloseHandle(cInW); CloseHandle(cOutR);
+        if (job) CloseHandle(job);
+        CloseHandle(pi.hProcess);
+        return;
+    }
     std::thread reader([cOutR, readEv, stopEv, Q_, oemCarry]() {
         char b[8192]; DWORD n;
         for (;;) {
@@ -190,7 +279,7 @@ void run_shell(ssh_channel ch, const std::string& shell_dir, bool exec, const st
             while (!Q_->q.empty()) { popped.emplace_back(std::move(Q_->q.front())); Q_->q.pop_front(); }
         }
         for (const auto& s : popped)   // write outside the lock
-            if (ssh_channel_write(ch, s.data(), (uint32_t)s.size()) < 0) return false;
+            if (!ch_write_all(ch, s.data(), s.size())) return false;
         return true;
     };
 
@@ -212,17 +301,17 @@ void run_shell(ssh_channel ch, const std::string& shell_dir, bool exec, const st
             if (r > 0) {
                 if (exec) {
                     std::string oem = cp_utf82oem(buf, r, u2oCarry);   // transcode stdin too (text scripts)
-                    if (cInW != INVALID_HANDLE_VALUE && !oem.empty() && !write_all(cInW, oem.data(), oem.size())) {
-                        LOG("child stdin write failed - closing stdin");
+                    if (cInW != INVALID_HANDLE_VALUE && !oem.empty() && !write_all_ov(cInW, oem.data(), oem.size(), abort)) {
+                        LOG("child stdin write failed (pipe full / broken) - closing stdin");
                         CloseHandle(cInW); cInW = INVALID_HANDLE_VALUE; stdinClosed = true;
                     }
                 } else {
-                    if (ssh_channel_write(ch, buf, (uint32_t)r) < 0) break;   // local echo
+                    if (!ch_write_all(ch, buf, (size_t)r)) break;   // local echo
                     std::string exp; exp.reserve(r + 8);
                     for (int i = 0; i < r; ++i) exp += (buf[i] == '\r') ? std::string("\r\n") : std::string(1, buf[i]);
                     std::string oem = cp_utf82oem(exp.data(), exp.size(), u2oCarry);
-                    if (!oem.empty() && cInW != INVALID_HANDLE_VALUE && !write_all(cInW, oem.data(), oem.size())) {
-                        LOG("child stdin write failed - closing stdin");
+                    if (!oem.empty() && cInW != INVALID_HANDLE_VALUE && !write_all_ov(cInW, oem.data(), oem.size(), abort)) {
+                        LOG("child stdin write failed (pipe full / broken) - closing stdin");
                         CloseHandle(cInW); cInW = INVALID_HANDLE_VALUE; stdinClosed = true;
                     }
                 }
@@ -273,6 +362,12 @@ void shell_session(ssh_session s, App* app) {
     ssh_channel ch = accept_channel(s);
     if (!ch) return;
     ChanReq rq = wait_channel_requests(s, !a.opts.no_pty);
+
+    if (!rq.shell && !rq.exec) {   // client asked for neither (or stalled past the budget)
+        ch_write_str(ch, "remoted: no shell or exec requested\r\n");
+        ssh_channel_send_eof(ch); ssh_channel_close(ch); ssh_channel_free(ch);
+        return;   // guard releases occupancy
+    }
 
     // a forced command replaces whatever the client asked for
     bool exec = rq.exec;

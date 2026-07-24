@@ -8,56 +8,76 @@
 
 std::atomic<bool> g_stop{ false };
 
-// ---- session abort registry (for disconnect-all) ----
-// disconnect-all only sets flags; each worker polls its own flag and tears down
-// on its own thread -> no cross-thread ssh_* calls (which used to AV).
-static std::mutex g_ab_m;
-static std::vector<std::shared_ptr<std::atomic<bool>>> g_aborts;
+// mutable statics live in a leaked struct: shutdown stragglers (detached after
+// the join budget) may still touch them while the CRT destroys statics.
+namespace {
+struct SshStatics {
+    // ---- session abort registry (for disconnect-all) ----
+    // disconnect-all only sets flags; each worker polls its own flag and tears
+    // down on its own thread -> no cross-thread ssh_* calls (which used to AV).
+    std::mutex ab_m;
+    std::vector<std::shared_ptr<std::atomic<bool>>> aborts;
+
+    // ---- worker thread tracking (clean shutdown) ----
+    struct Tracked {
+        std::thread th;
+        std::shared_ptr<std::atomic<bool>> done;
+    };
+    std::mutex th_m;
+    std::vector<std::shared_ptr<Tracked>> tracked;
+
+    // active session workers, for the concurrency cap
+    std::atomic<int> sessions{ 0 };
+
+    // ports + bind host, so shutdown can wake a blocked ssh_bind_accept via a
+    // throwaway connect to the address we actually bound
+    std::mutex ports_m;
+    std::vector<uint16_t> ports;
+    std::string bind_host;
+};
+}
+static SshStatics& S() { static auto* p = new SshStatics(); return *p; }
+
+// hard cap on concurrent session workers: thread-per-connection needs a ceiling
+static const int kMaxSessions = 64;
 
 std::shared_ptr<std::atomic<bool>> reg_abort() {
     auto a = std::make_shared<std::atomic<bool>>(false);
-    std::lock_guard<std::mutex> lk(g_ab_m);
-    g_aborts.push_back(a);
+    std::lock_guard<std::mutex> lk(S().ab_m);
+    S().aborts.push_back(a);
     return a;
 }
 void unreg_abort(const std::shared_ptr<std::atomic<bool>>& a) {
-    std::lock_guard<std::mutex> lk(g_ab_m);
-    g_aborts.erase(std::remove(g_aborts.begin(), g_aborts.end(), a), g_aborts.end());
+    std::lock_guard<std::mutex> lk(S().ab_m);
+    auto& v = S().aborts;
+    v.erase(std::remove(v.begin(), v.end(), a), v.end());
 }
-
-// ---- worker thread tracking (clean shutdown) ----
-// Workers used to be fully detached; on process exit a detached thread could
-// still be inside a libssh call and crash. Tracked threads flag themselves done
-// so they can be reaped, and ssh_request_shutdown() joins what is still running.
-namespace {
-struct Tracked {
-    std::thread th;
-    std::shared_ptr<std::atomic<bool>> done;
-};
-}
-static std::mutex g_th_m;
-static std::vector<std::shared_ptr<Tracked>> g_tracked;
 
 void spawn_tracked(std::function<void()> fn) {
-    auto t = std::make_shared<Tracked>();
+    auto t = std::make_shared<SshStatics::Tracked>();
     t->done = std::make_shared<std::atomic<bool>>(false);
-    std::weak_ptr<Tracked> weak = t;
+    std::weak_ptr<SshStatics::Tracked> weak = t;
     t->th = std::thread([weak, fn]() {
-        fn();
+        // a worker that escapes via exception would std::terminate the whole
+        // process - catch everything, and always flag done
+        try { fn(); }
+        catch (const std::exception& e) { LOG("worker exception: %s", e.what()); }
+        catch (...) { LOG("worker unknown exception"); }
         if (auto p = weak.lock()) p->done->store(true);
     });
-    std::lock_guard<std::mutex> lk(g_th_m);
+    std::lock_guard<std::mutex> lk(S().th_m);
     if (g_stop.load()) {   // shutdown join may already be done: never track
         t->th.detach();    // (a joinable std::thread left in a static would terminate)
         return;
     }
     // reap finished workers so the list doesn't grow unbounded
-    for (auto it = g_tracked.begin(); it != g_tracked.end();) {
+    auto& v = S().tracked;
+    for (auto it = v.begin(); it != v.end();) {
         if ((*it)->done->load() && (*it)->th.joinable()) (*it)->th.join();   // already done -> instant
-        if (!(*it)->th.joinable()) it = g_tracked.erase(it);
+        if (!(*it)->th.joinable()) it = v.erase(it);
         else ++it;
     }
-    g_tracked.push_back(std::move(t));
+    v.push_back(std::move(t));
 }
 
 // Join all tracked workers within an overall time budget. Called from the UI
@@ -68,19 +88,20 @@ void join_tracked(DWORD budget_ms) {
     ULONGLONG deadline = GetTickCount64() + budget_ms;
     for (;;) {
         {
-            std::lock_guard<std::mutex> lk(g_th_m);
+            std::lock_guard<std::mutex> lk(S().th_m);
+            auto& v = S().tracked;
             bool pending = false;
-            for (auto& p : g_tracked)
+            for (auto& p : v)
                 if (p->th.joinable() && !p->done->load()) { pending = true; break; }
             if (!pending) {
-                for (auto& p : g_tracked) if (p->th.joinable()) p->th.join();
-                g_tracked.clear();
+                for (auto& p : v) if (p->th.joinable()) p->th.join();
+                v.clear();
                 return;
             }
             if (GetTickCount64() >= deadline) {
                 // out of budget: detach so static destruction won't std::terminate
-                for (auto& p : g_tracked) if (p->th.joinable()) p->th.detach();
-                g_tracked.clear();
+                for (auto& p : v) if (p->th.joinable()) p->th.detach();
+                v.clear();
                 return;
             }
         }
@@ -88,23 +109,35 @@ void join_tracked(DWORD budget_ms) {
     }
 }
 
-// ports we listen on, so shutdown can wake a blocked ssh_bind_accept via a
-// throwaway localhost connect.
-static std::mutex g_ports_m;
-static std::vector<uint16_t> g_ports;
-
 static void poke_port(uint16_t port) {
-    SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    std::string host;
+    { std::lock_guard<std::mutex> lk(S().ports_m); host = S().bind_host; }
+    std::string h = host;
+    if (h.empty() || h == "0.0.0.0") h = "127.0.0.1";
+    if (h == "::") h = "::1";
+
+    sockaddr_storage a{}; int alen = 0; int fam = AF_INET;
+    if (h.find(':') != std::string::npos) {   // IPv6 literal
+        auto* a6 = (sockaddr_in6*)&a;
+        a6->sin6_family = AF_INET6;
+        a6->sin6_port = htons(port);
+        if (inet_pton(AF_INET6, h.c_str(), &a6->sin6_addr) != 1) return;
+        fam = AF_INET6; alen = sizeof(sockaddr_in6);
+    } else {
+        auto* a4 = (sockaddr_in*)&a;
+        a4->sin_family = AF_INET;
+        a4->sin_port = htons(port);
+        if (inet_pton(AF_INET, h.c_str(), &a4->sin_addr) != 1)
+            inet_pton(AF_INET, "127.0.0.1", &a4->sin_addr);   // hostname: best-effort loopback
+        alen = sizeof(sockaddr_in);
+    }
+    SOCKET s = socket(fam, SOCK_STREAM, IPPROTO_TCP);
     if (s == INVALID_SOCKET) return;
-    struct sockaddr_in a{};
-    a.sin_family = AF_INET;
-    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    a.sin_port = htons(port);
     // non-blocking connect + a bounded wait: never hang the UI thread even if
     // the stack is being weird (loopback normally completes instantly)
     u_long nb = 1;
     ioctlsocket(s, FIONBIO, &nb);
-    connect(s, (struct sockaddr*)&a, sizeof(a));
+    connect(s, (sockaddr*)&a, alen);
     fd_set w; FD_ZERO(&w); FD_SET(s, &w);
     timeval tv{ 0, 200 * 1000 };
     select(0, nullptr, &w, nullptr, &tv);   // let the handshake complete -> wakes accept
@@ -113,7 +146,7 @@ static void poke_port(uint16_t port) {
 
 void ssh_disconnect_all() {
     std::vector<std::shared_ptr<std::atomic<bool>>> copy;
-    { std::lock_guard<std::mutex> lk(g_ab_m); copy = g_aborts; }
+    { std::lock_guard<std::mutex> lk(S().ab_m); copy = S().aborts; }
     LOG("disconnect-all: flagging %d session(s)", (int)copy.size());
     for (auto& a : copy) a->store(true);
 }
@@ -122,7 +155,7 @@ void ssh_request_shutdown() {
     g_stop = true;
     ssh_disconnect_all();
     std::vector<uint16_t> ports;
-    { std::lock_guard<std::mutex> lk(g_ports_m); ports = g_ports; }
+    { std::lock_guard<std::mutex> lk(S().ports_m); ports = S().ports; }
     for (uint16_t p : ports) poke_port(p);   // wake any accept blocked in ssh_bind_accept
     // wait for accept loops + session workers to unwind (they poll their abort
     // flag every 5-50ms). Hard budget: this runs on the UI thread, so a stuck
@@ -142,21 +175,29 @@ static ssh_bind make_bind(const std::string& host, uint16_t port, const std::str
         ssh_bind_free(b); return nullptr;
     }
     LOG("ssh listening on %s:%u", host.c_str(), port);
-    { std::lock_guard<std::mutex> lk(g_ports_m); g_ports.push_back(port); }
+    { std::lock_guard<std::mutex> lk(S().ports_m);
+      S().ports.push_back(port);
+      S().bind_host = host; }
     return b;
 }
 
 static void accept_loop(ssh_bind b, App* app, std::function<void(ssh_session, App*)> fn) {
     while (!g_stop) {
         ssh_session s = ssh_new();
-        if (!s) continue;
+        if (!s) { Sleep(50); continue; }   // resource pressure: back off, don't spin
         if (ssh_bind_accept(b, s) != SSH_OK) {
             ssh_free(s);
             if (g_stop) break;
             Sleep(50); continue;
         }
         if (g_stop) { ssh_free(s); break; }   // accept woken by a shutdown poke
+        if (S().sessions.load() >= kMaxSessions) {
+            LOG("session cap (%d) reached - dropping new connection", kMaxSessions);
+            ssh_disconnect(s); ssh_free(s);
+            continue;
+        }
         spawn_tracked([s, app, fn]() {
+            S().sessions++;
             try {
                 // a silent/half-open connection will time out instead of
                 // pinning a thread forever.
@@ -170,6 +211,7 @@ static void accept_loop(ssh_bind b, App* app, std::function<void(ssh_session, Ap
                 LOG("session unknown exception");
             }
             ssh_disconnect(s); ssh_free(s);
+            S().sessions--;   // spawn_tracked guarantees we always get here
         });
     }
     ssh_bind_free(b);
@@ -188,6 +230,8 @@ static void bind_serial(App* app, std::string host, SerialCfg sc, std::string ho
 }
 
 void ssh_start(App* app) {
+    WSADATA wsa{};   // libssh's ssh_init does this too, but poke_port is ours
+    WSAStartup(MAKEWORD(2, 2), &wsa);
     ssh_init();
     ensure_host_key(app->host_key_path());
     std::string host = app->listen_host();

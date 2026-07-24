@@ -11,12 +11,17 @@ void ensure_host_key(const std::string& path) {
         ssh_key_free(k); LOG("host key present: %s", path.c_str()); return;
     }
     auto pos = path.find_last_of("/\\");
-    if (pos != std::string::npos) CreateDirectoryW(utf8_to_wide(path.substr(0, pos)).c_str(), nullptr);
+    if (pos != std::string::npos) ensure_dir(path.substr(0, pos));
     if (ssh_pki_generate(SSH_KEYTYPE_ED25519, 0, &k) == SSH_OK) {
-        ssh_pki_export_privkey_file(k, nullptr, nullptr, nullptr, path.c_str());
-        ssh_pki_export_pubkey_file(k, (path + ".pub").c_str());
+        if (ssh_pki_export_privkey_file(k, nullptr, nullptr, nullptr, path.c_str()) != SSH_OK)
+            LOG("host key export FAILED: %s", path.c_str());
+        else if (ssh_pki_export_pubkey_file(k, (path + ".pub").c_str()) != SSH_OK)
+            LOG("host pubkey export FAILED: %s.pub", path.c_str());
+        else
+            LOG("generated host key: %s", path.c_str());
         ssh_key_free(k);
-        LOG("generated host key: %s", path.c_str());
+    } else {
+        LOG("host key generation FAILED (ssh_pki_generate)");
     }
 }
 
@@ -27,10 +32,14 @@ std::string peer_ip(ssh_session s) {
     sockaddr_storage ss{}; int len = sizeof(ss);
     if (getpeername(fd, (sockaddr*)&ss, &len) != 0) return "";
     char buf[INET6_ADDRSTRLEN] = {};
-    if (ss.ss_family == AF_INET)
+    if (ss.ss_family == AF_INET) {
         inet_ntop(AF_INET, &((sockaddr_in*)&ss)->sin_addr, buf, sizeof(buf));
-    else if (ss.ss_family == AF_INET6)
+    } else if (ss.ss_family == AF_INET6) {
         inet_ntop(AF_INET6, &((sockaddr_in6*)&ss)->sin6_addr, buf, sizeof(buf));
+        // dual-stack listeners hand us IPv4-mapped addresses; normalize so
+        // from="10.0.*" matches as an operator would expect
+        if (strncmp(buf, "::ffff:", 7) == 0) memmove(buf, buf + 7, strlen(buf + 7) + 1);
+    }
     return buf;
 }
 
@@ -39,7 +48,8 @@ namespace {
 
 struct Tok { std::string text; size_t off; };
 
-// whitespace tokenizer that keeps quoted sections (e.g. command="a b") together
+// whitespace tokenizer that keeps quoted sections (e.g. command="a b") together;
+// backslash escapes the next char inside quotes (\" doesn't flip quote state)
 std::vector<Tok> tokenize_quoted(const std::string& line) {
     std::vector<Tok> out;
     size_t i = 0, n = line.size();
@@ -50,6 +60,7 @@ std::vector<Tok> tokenize_quoted(const std::string& line) {
         bool inq = false;
         std::string t;
         while (i < n && (inq || (line[i] != ' ' && line[i] != '\t'))) {
+            if (inq && line[i] == '\\' && i + 1 < n) { t += line[i]; t += line[i + 1]; i += 2; continue; }
             if (line[i] == '"') inq = !inq;
             t += line[i];
             i++;
@@ -67,8 +78,9 @@ bool is_keytype(const std::string& s) {
 std::string unquote(const std::string& v) {
     if (v.size() >= 2 && v.front() == '"' && v.back() == '"') {
         std::string r;
-        for (size_t i = 1; i + 1 < v.size(); ++i) {
-            if (v[i] == '\\' && i + 2 < v.size() && (v[i + 1] == '"' || v[i + 1] == '\\')) { r += v[i + 1]; ++i; }
+        const size_t last = v.size() - 1;   // index of the closing quote
+        for (size_t i = 1; i < last; ++i) {
+            if (v[i] == '\\' && i + 1 < last && (v[i + 1] == '"' || v[i + 1] == '\\')) { r += v[i + 1]; ++i; }
             else r += v[i];
         }
         return r;
@@ -80,10 +92,14 @@ KeyOpts parse_key_options(const std::string& s, const std::string& keydesc) {
     KeyOpts o;
     size_t i = 0, n = s.size();
     while (i < n) {
-        // split on commas outside quotes
+        // split on commas outside quotes (\" stays inside via the escape)
         bool inq = false;
         size_t start = i;
-        while (i < n && (inq || s[i] != ',')) { if (s[i] == '"') inq = !inq; i++; }
+        while (i < n && (inq || s[i] != ',')) {
+            if (inq && s[i] == '\\' && i + 1 < n) { i += 2; continue; }
+            if (s[i] == '"') inq = !inq;
+            i++;
+        }
         std::string item = s.substr(start, i - start);
         if (i < n) i++;   // skip the comma
         auto b = item.find_first_not_of(" \t");
@@ -158,6 +174,9 @@ std::vector<AuthKey> load_auth_keys(const std::string& path) {
     int lineno = 0;
     while (std::getline(f, line)) {
         lineno++;
+        // getline keeps the \r of CRLF files; a trailing \r on the base64 token
+        // makes libssh reject the key (silently, if the line has no comment)
+        while (!line.empty() && (line.back() == '\r' || line.back() == '\n')) line.pop_back();
         if (line.empty() || line[0] == '#') continue;
         auto t = tokenize_quoted(line);
         size_t ki = t.size();
@@ -180,6 +199,8 @@ std::vector<AuthKey> load_auth_keys(const std::string& path) {
         ssh_key k = nullptr;
         if (ssh_pki_import_pubkey_base64(b64.c_str(), ty, &k) == SSH_OK)
             keys.push_back({ k, comment, opts });
+        else
+            LOG("authorized_keys:%d: key import failed - line skipped", lineno);
     }
     LOG("loaded %d authorized keys", (int)keys.size());
     return keys;
@@ -199,46 +220,57 @@ std::string key_fp(ssh_key k) {
     return r;
 }
 
-static std::mutex g_nf_m;
-static std::set<std::string> g_notified_fp;   // unknown fingerprints we already ballooned about
+// mutable statics are intentionally leaked: shutdown stragglers (detached
+// after the join budget) may still touch them while the CRT destroys statics.
+struct AuthStatics {
+    std::mutex nf_m;
+    std::set<std::string> notified_fp;                          // fps we already ballooned about
+    std::mutex ip_m;
+    std::map<std::string, std::pair<int, ULONGLONG>> ip_fails;  // ip -> {fails, window start}
+};
+static AuthStatics& A() { static auto* p = new AuthStatics(); return *p; }
 
 // Notify once per fingerprint when a session ultimately fails to authenticate.
 void notify_unknown_key(App* app, const std::string& fp) {
     if (!app || fp.empty()) return;
     bool do_notify = false;
-    { std::lock_guard<std::mutex> lk(g_nf_m);
-      if (g_notified_fp.size() < 64 && g_notified_fp.insert(fp).second) do_notify = true; }
+    { std::lock_guard<std::mutex> lk(A().nf_m);
+      auto& seen = A().notified_fp;
+      if (seen.size() >= 64) seen.clear();      // cap: evict all rather than going silent forever
+      if (seen.insert(fp).second) do_notify = true; }
     if (do_notify) {
         LOG("auth failed; last offered key: %s", fp.c_str());
         app->request_notify(L"unknown key rejected", utf8_to_wide(fp));
     }
 }
 
-// ---- per-IP throttle: >10 failed sessions within 60s -> drop early ----
-static std::mutex g_ip_m;
-static std::map<std::string, std::pair<int, ULONGLONG>> g_ip_fails;   // ip -> {fails, window start}
-
+// ---- per-IP throttle: 10 failed sessions within 60s -> drop early ----
 static bool ip_throttled(const std::string& ip) {
     if (ip.empty()) return false;
-    std::lock_guard<std::mutex> lk(g_ip_m);
+    std::lock_guard<std::mutex> lk(A().ip_m);
     auto now = GetTickCount64();
-    auto it = g_ip_fails.find(ip);
-    if (it == g_ip_fails.end()) return false;
-    if (now - it->second.second > 60000) { g_ip_fails.erase(it); return false; }
+    auto it = A().ip_fails.find(ip);
+    if (it == A().ip_fails.end()) return false;
+    if (now - it->second.second > 60000) { A().ip_fails.erase(it); return false; }
     return it->second.first >= 10;
 }
 static void ip_record_fail(const std::string& ip) {
     if (ip.empty()) return;
-    std::lock_guard<std::mutex> lk(g_ip_m);
+    std::lock_guard<std::mutex> lk(A().ip_m);
     ULONGLONG now = GetTickCount64();
-    auto& e = g_ip_fails[ip];
+    auto& e = A().ip_fails[ip];
     if (now - e.second > 60000) e = { 0, now };
     e.first++;
-    if (g_ip_fails.size() > 1024) {   // bound: drop expired windows; clear if still huge
-        for (auto it = g_ip_fails.begin(); it != g_ip_fails.end();)
-            if (now - it->second.second > 60000) it = g_ip_fails.erase(it); else ++it;
-        if (g_ip_fails.size() > 4096) g_ip_fails.clear();
+    if (A().ip_fails.size() > 1024) {   // bound: drop expired windows; clear if still huge
+        for (auto it = A().ip_fails.begin(); it != A().ip_fails.end();)
+            if (now - it->second.second > 60000) it = A().ip_fails.erase(it); else ++it;
+        if (A().ip_fails.size() > 4096) A().ip_fails.clear();
     }
+}
+static void ip_record_success(const std::string& ip) {
+    if (ip.empty()) return;
+    std::lock_guard<std::mutex> lk(A().ip_m);
+    A().ip_fails.erase(ip);   // a working login resets the failure window
 }
 
 Auth authenticate(ssh_session s, const std::vector<AuthKey>& keys) {
@@ -277,6 +309,7 @@ Auth authenticate(ssh_session s, const std::vector<AuthKey>& keys) {
                     case SSH_PUBLICKEY_STATE_VALID: {
                         Auth r; r.ok = true; r.fp = key_fp(off);
                         r.comment = ak.comment; r.opts = ak.opts;
+                        ip_record_success(ip);
                         ssh_message_auth_reply_success(msg, 0);
                         ssh_message_free(msg);
                         return r;
