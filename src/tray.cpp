@@ -64,7 +64,13 @@ void Tray::show_balloon(const std::wstring& title, const std::wstring& body) {
 
 int Tray::loop() {
     MSG msg;
-    while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
+    for (;;) {
+        BOOL r = GetMessageW(&msg, nullptr, 0, 0);
+        if (r == 0) break;                    // WM_QUIT
+        if (r == -1) {                        // error: don't spin silently
+            LOG("GetMessage failed err=%lu - exiting message loop", GetLastError());
+            break;
+        }
         TranslateMessage(&msg); DispatchMessageW(&msg);
     }
     return (int)msg.wParam;
@@ -82,8 +88,10 @@ LRESULT CALLBACK Tray::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
 
     switch (msg) {
     case WM_APP_BALLOON:
-        if (ov) self->show_balloon(L"remoted already running",
-                                   L"ssh session is up - see the tray icon.");
+        // a second instance asked us to re-announce; this has nothing to do
+        // with the overlay, so guard on the tray itself
+        if (self) self->show_balloon(L"remoted already running",
+                                     L"ssh session is up - see the tray icon.");
         return 0;
     case WM_APP_NOTIFY: {
         std::vector<std::pair<std::wstring, std::wstring>> v;
@@ -105,17 +113,18 @@ LRESULT CALLBACK Tray::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     case WM_APP_STATE: {
         int active = (int)wp;
-        if (app && app->cfg.overlay.enabled && ov) {
+        OverlayCfg oc = app ? app->overlay_cfg() : OverlayCfg{};   // range-clamped at load
+        if (app && oc.enabled && ov) {
             if (active > 0) { ov->show_now(); KillTimer(h, TIMER_RETRACT); }
-            else {
-                // clamp: 0 / negative would make the retract timer misbehave
-                int d = app->cfg.overlay.retract_delay_sec;
-                if (d < 1) d = 3;
-                SetTimer(h, TIMER_RETRACT, d * 1000, nullptr);
-            }
+            else SetTimer(h, TIMER_RETRACT, oc.retract_delay_sec * 1000, nullptr);
         }
         return 0;
     }
+    case WM_DEVICECHANGE:
+        // a device was added/removed: re-resolve configured serials against the
+        // new device set (cheap; only fires on actual pnp changes)
+        if (app) app->refresh();
+        return 0;
     case WM_TIMER:
         if (wp == TIMER_RETRACT) {
             KillTimer(h, TIMER_RETRACT);
@@ -136,6 +145,7 @@ LRESULT CALLBACK Tray::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             POINT pt; GetCursorPos(&pt);
             SetForegroundWindow(h);
             TrackPopupMenu(m, TPM_RIGHTBUTTON, pt.x, pt.y, 0, h, nullptr);
+            PostMessageW(h, WM_NULL, 0, 0);   // per MSDN: lets the menu dismiss cleanly
             DestroyMenu(m);
         } else if (lp == WM_LBUTTONDBLCLK) {
             PostMessageW(h, WM_COMMAND, IDM_STATUS, 0);
@@ -173,7 +183,11 @@ LRESULT CALLBACK Tray::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             break;
         case IDM_CFG: {
             std::wstring p = utf8_to_wide(app->config_path);
-            ShellExecuteW(h, L"open", L"notepad.exe", p.c_str(), nullptr, SW_SHOWNORMAL);
+            HINSTANCE r = ShellExecuteW(h, L"open", L"notepad.exe", p.c_str(), nullptr, SW_SHOWNORMAL);
+            if ((INT_PTR)r <= 32) {   // ShellExecute returns <= 32 on failure
+                LOG("open config in notepad failed (%d)", (int)(INT_PTR)r);
+                self->show_balloon(L"remoted", L"could not open remoted.json in notepad");
+            }
             break;
         }
         case IDM_RELOAD:
@@ -182,8 +196,7 @@ LRESULT CALLBACK Tray::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             break;
         case IDM_EXIT:
             Shell_NotifyIconW(NIM_DELETE, &self->nid_);
-            ssh_request_shutdown();   // stop accept loops + drop sessions cleanly
-            Sleep(150);
+            ssh_request_shutdown();   // stops accept loops and joins workers (bounded)
             PostQuitMessage(0);
             break;
         }

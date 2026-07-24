@@ -33,17 +33,30 @@ void resolve_config_paths(AppConfig& c, const std::wstring& exe_dir);
 
 class App {
 public:
-    AppConfig cfg;
     std::string  config_path;
     std::wstring exe_dir;              // base dir for resolving relative config paths
     HWND      hwnd_main = nullptr;     // owner window (tray) for PostMessage
     Overlay*  overlay  = nullptr;
 
+    // load config from config_path, resolve paths, ensure the key dir exists.
+    // Returns false on a parse error (defaults are in effect). Called once at
+    // startup; reload() handles later changes.
+    bool init();
     void start();                      // enumerate devices, build status table
     void refresh() const;              // re-enumerate COM ports, rebuild status table
     // reload config from config_path and re-apply (keeps listeners bound at startup).
-    // cfg is swapped under m_; readers of cfg are lock-free (see app.cpp).
     void reload();
+
+    // thread-safe config accessors: cfg_ is swapped under m_ by reload(), so
+    // every reader goes through one of these (each returns a copy under m_).
+    std::string authorized_keys_path() const;
+    std::string host_key_path() const;
+    std::string listen_host() const;
+    uint16_t    listen_port() const;
+    std::string shell_dir() const;
+    OverlayCfg  overlay_cfg() const;
+    std::vector<SerialCfg> serial_cfgs() const;
+    bool identity_for(const std::string& fp, Identity& out) const;
 
     std::vector<SerialStatus> snapshot() const;            // for MOTD
     std::string find_com_for(const std::string& name) const;
@@ -59,8 +72,6 @@ public:
     bool mark_busy(const std::string& name, int token, const std::string& holder);
     void clear_busy(const std::string& name, int token);
 
-    const Identity* identity_for(const std::string& fp) const;
-
     // request a tray balloon (thread-safe; drained by the tray window)
     void request_notify(const std::wstring& title, const std::wstring& body);
     std::mutex nm_;
@@ -69,6 +80,7 @@ public:
     // build the text shown on the overlay (message + active holders)
     std::wstring overlay_text() const;
 private:
+    AppConfig                cfg_;       // swapped under m_ by reload()
     mutable std::vector<EnumCom>     devs_;    // refreshed on demand by refresh()
     mutable std::mutex       m_;
     std::atomic<int>         next_token_{1};

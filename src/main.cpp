@@ -57,26 +57,32 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
 
     try {
 
-    // single-instance: tell the running copy to re-announce itself, then exit
-    {
-        HANDLE single = CreateMutexW(nullptr, TRUE, L"Local\\remoted-singleton-v1");
-        if (GetLastError() == ERROR_ALREADY_EXISTS) {
-            HWND h = FindWindowW(L"remoted_tray", nullptr);
-            if (h) PostMessageW(h, WM_APP_BALLOON, 0, 0);
-            LOG("another instance is running - exiting");
-            return 0;
-        }
+    // single-instance: tell the running copy to re-announce itself, then exit.
+    // the mutex handle must stay open for the process lifetime (that IS the
+    // singleton), so it is parked in a static; the OS reclaims it at exit.
+    static HANDLE g_single = nullptr;
+    g_single = CreateMutexW(nullptr, TRUE, L"Local\\remoted-singleton-v1");
+    if (GetLastError() == ERROR_ALREADY_EXISTS) {
+        HWND h = FindWindowW(L"remoted_tray", nullptr);
+        if (h) PostMessageW(h, WM_APP_BALLOON, 0, 0);
+        LOG("another instance is running - exiting");
+        CloseHandle(g_single);   // this copy is exiting; the other one holds its own
+        g_single = nullptr;
+        return 0;
     }
     LOG("step: mutex ok");
 
     std::string cfg_path = wide_to_utf8(exe_dir) + "\\remoted.json";
 
-    App app;
-    app.config_path = cfg_path;
-    app.exe_dir     = exe_dir;
+    // App is heap-allocated and intentionally never deleted: shutdown gives
+    // stragglers a 2s join budget and then detaches them, so a worker can
+    // still be unwinding (and touching App) after the message loop exits.
+    // A leaked App outlives every thread; process exit reclaims it.
+    App* app = new App();
+    app->config_path = cfg_path;
+    app->exe_dir     = exe_dir;
     LOG("step: loading config");
-    bool cfg_ok = true;
-    app.cfg = load_config(cfg_path, &cfg_ok);
+    bool cfg_ok = app->init();
     LOG("step: config loaded (ok=%d)", cfg_ok ? 1 : 0);
     if (!cfg_ok) {
         MessageBoxW(nullptr,
@@ -84,36 +90,28 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
             L"remoted config", MB_ICONWARNING);
     }
 
-    // resolve paths + authorized_keys preference (shared with App::reload)
-    resolve_config_paths(app.cfg, exe_dir);
-
-    LOG("step: ensuring keys dir");
-    auto kp = app.cfg.host_key.find_last_of("/\\");
-    if (kp != std::string::npos)
-        CreateDirectoryW(utf8_to_wide(app.cfg.host_key.substr(0, kp)).c_str(), nullptr);
-
     LOG("step: enumerating serial ports");
-    app.start();
+    app->start();
     LOG("step: app started");
 
     Overlay overlay;
     LOG("step: creating overlay");
-    if (!overlay.create(&app, hInst)) { LOG("overlay create FAILED"); }
-    app.overlay = &overlay;
+    if (!overlay.create(app, hInst)) { LOG("overlay create FAILED"); }
+    app->overlay = &overlay;
 
     Tray tray;
     LOG("step: creating tray");
-    if (!tray.create(&app, &overlay, hInst)) {
+    if (!tray.create(app, &overlay, hInst)) {
         MessageBoxW(nullptr, L"tray init failed", L"remoted", MB_ICONERROR);
         return 1;
     }
 
     LOG("step: starting ssh");
     cp_init();
-    ssh_start(&app);
+    ssh_start(app);
 
     {
-        std::wstring body = L"ssh :" + std::to_wstring(app.cfg.listen_port) +
+        std::wstring body = L"ssh :" + std::to_wstring(app->listen_port()) +
                             L" ready. (if no tray icon, check the overflow / hidden-icons area)";
         tray.show_balloon(L"remoted running", body);
     }
