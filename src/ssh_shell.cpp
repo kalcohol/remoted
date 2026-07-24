@@ -18,14 +18,19 @@ ssh_channel accept_channel(ssh_session s) {
     }
 }
 
-ChanReq wait_channel_requests(ssh_session s) {
+ChanReq wait_channel_requests(ssh_session s, bool allow_pty) {
     ChanReq r;
     for (int i = 0; i < 64 && !(r.shell || r.exec); ++i) {
         ssh_message msg = ssh_message_get(s);
         if (!msg) break;
         if (ssh_message_type(msg) == SSH_REQUEST_CHANNEL) {
             int st = ssh_message_subtype(msg);
-            if (st == SSH_CHANNEL_REQUEST_PTY)               { ssh_message_channel_request_reply_success(msg); }
+            if (st == SSH_CHANNEL_REQUEST_PTY) {
+                // honor the key's no-pty option; remoted has no real pty anyway,
+                // refusing is honest and the shell works fine without one
+                if (allow_pty) ssh_message_channel_request_reply_success(msg);
+                else ssh_message_reply_default(msg);
+            }
             else if (st == SSH_CHANNEL_REQUEST_WINDOW_CHANGE){ ssh_message_channel_request_reply_success(msg); }
             else if (st == SSH_CHANNEL_REQUEST_ENV)          { ssh_message_channel_request_reply_success(msg); }
             else if (st == SSH_CHANNEL_REQUEST_SHELL)        { ssh_message_channel_request_reply_success(msg); r.shell = true; }
@@ -55,7 +60,7 @@ void send_motd(ssh_channel ch, App& app) {
         m += "  " + st.name + "  " + st.com + "  :" + std::to_string(st.listen_port) + "  " + state + "\r\n";
     }
     m += "================\r\n\r\n";
-    ssh_channel_write(ch, m.data(), (uint32_t)m.size());
+    ch_write_str(ch, m);
 }
 
 // anonymous pipe whose READ end is overlapped, so CancelIoEx can cancel a
@@ -74,16 +79,27 @@ static bool make_overlapped_pipe(HANDLE& rd, HANDLE& wr) {
     return true;
 }
 
+// WriteFile to a pipe may short-write; loop until everything is in.
+static bool write_all(HANDLE h, const char* data, size_t n) {
+    size_t off = 0;
+    while (off < n) {
+        DWORD w = 0;
+        if (!WriteFile(h, data + off, (DWORD)(n - off), &w, nullptr) || w == 0) return false;
+        off += w;
+    }
+    return true;
+}
+
 // ---- child process pump (pipes + OEM<->UTF-8 transcoding) ----
 // exec: cmd /C <cmd>. interactive shell: cmd /K with local echo + \r->\r\n.
 // All ssh_channel_* calls are on this thread only; the reader pushes child
 // output (already converted to UTF-8) into a queue. The stdout read end is an
 // overlapped pipe so we can CancelIoEx it on teardown -> the reader always
 // unblocks and join() never deadlocks (even if a grandchild holds the pipe).
-void run_shell(ssh_channel ch, const AppConfig& cfg, bool exec, const std::string& exec_cmd,
+void run_shell(ssh_channel ch, const std::string& shell_dir, bool exec, const std::string& exec_cmd,
                const std::shared_ptr<std::atomic<bool>>& abort) {
     std::wstring cmdline = exec ? (L"cmd.exe /C " + utf8_to_wide(exec_cmd)) : L"cmd.exe /K";
-    std::wstring cwd = utf8_to_wide(cfg.shell_dir);
+    std::wstring cwd = utf8_to_wide(shell_dir);
 
     SECURITY_ATTRIBUTES sa{ sizeof(sa), nullptr, TRUE };
     HANDLE cInR, cInW;
@@ -102,8 +118,7 @@ void run_shell(ssh_channel ch, const AppConfig& cfg, bool exec, const std::strin
                              cwd.empty() ? nullptr : cwd.c_str(), &si, &pi);
     CloseHandle(cInR); CloseHandle(cOutW);
     if (!ok) {
-        const char* e = "remoted: CreateProcess failed\r\n";
-        ssh_channel_write(ch, e, (uint32_t)strlen(e));
+        ch_write_str(ch, "remoted: CreateProcess failed\r\n");
         CloseHandle(cInW); CloseHandle(cOutR);
         return;
     }
@@ -122,6 +137,10 @@ void run_shell(ssh_channel ch, const AppConfig& cfg, bool exec, const std::strin
             job = nullptr;
         }
     }
+    auto kill_tree = [&]() {
+        if (job) TerminateJobObject(job, 1);      // kills the whole tree
+        else TerminateProcess(pi.hProcess, 1);    // fallback if job setup failed
+    };
 
     // reader: child stdout (OEM) -> UTF-8 -> queue (never touches the channel)
     struct Q { std::mutex m; std::deque<std::string> q; bool eof = false; unsigned dropped = 0; };
@@ -162,14 +181,17 @@ void run_shell(ssh_channel ch, const AppConfig& cfg, bool exec, const std::strin
         Q_->eof = true;
     });
 
-    auto drain = [&]() {
+    // drain queued child output to the channel; false = channel write failed
+    auto drain = [&]() -> bool {
         std::vector<std::string> popped;
         {
             std::lock_guard<std::mutex> lk(Q_->m);
             popped.reserve(Q_->q.size());
             while (!Q_->q.empty()) { popped.emplace_back(std::move(Q_->q.front())); Q_->q.pop_front(); }
         }
-        for (const auto& s : popped) ssh_channel_write(ch, s.data(), (uint32_t)s.size());   // write outside the lock
+        for (const auto& s : popped)   // write outside the lock
+            if (ssh_channel_write(ch, s.data(), (uint32_t)s.size()) < 0) return false;
+        return true;
     };
 
     char buf[4096];
@@ -177,7 +199,7 @@ void run_shell(ssh_channel ch, const AppConfig& cfg, bool exec, const std::strin
     bool stdinClosed = false, childDone = false;
     while (true) {
         if (abort->load()) break;
-        drain();
+        if (!drain()) break;
 
         if (!stdinClosed && ssh_channel_is_eof(ch)) {
             CloseHandle(cInW); cInW = INVALID_HANDLE_VALUE; stdinClosed = true;
@@ -190,14 +212,18 @@ void run_shell(ssh_channel ch, const AppConfig& cfg, bool exec, const std::strin
             if (r > 0) {
                 if (exec) {
                     std::string oem = cp_utf82oem(buf, r, u2oCarry);   // transcode stdin too (text scripts)
-                    DWORD w = 0; if (cInW != INVALID_HANDLE_VALUE && !oem.empty()) WriteFile(cInW, oem.data(), (DWORD)oem.size(), &w, nullptr);
+                    if (cInW != INVALID_HANDLE_VALUE && !oem.empty() && !write_all(cInW, oem.data(), oem.size())) {
+                        LOG("child stdin write failed - closing stdin");
+                        CloseHandle(cInW); cInW = INVALID_HANDLE_VALUE; stdinClosed = true;
+                    }
                 } else {
-                    ssh_channel_write(ch, buf, (uint32_t)r);
+                    if (ssh_channel_write(ch, buf, (uint32_t)r) < 0) break;   // local echo
                     std::string exp; exp.reserve(r + 8);
                     for (int i = 0; i < r; ++i) exp += (buf[i] == '\r') ? std::string("\r\n") : std::string(1, buf[i]);
                     std::string oem = cp_utf82oem(exp.data(), exp.size(), u2oCarry);
-                    if (!oem.empty() && cInW != INVALID_HANDLE_VALUE) {
-                        DWORD w = 0; WriteFile(cInW, oem.data(), (DWORD)oem.size(), &w, nullptr);
+                    if (!oem.empty() && cInW != INVALID_HANDLE_VALUE && !write_all(cInW, oem.data(), oem.size())) {
+                        LOG("child stdin write failed - closing stdin");
+                        CloseHandle(cInW); cInW = INVALID_HANDLE_VALUE; stdinClosed = true;
                     }
                 }
             }
@@ -209,11 +235,14 @@ void run_shell(ssh_channel ch, const AppConfig& cfg, bool exec, const std::strin
     }
 
     if (cInW != INVALID_HANDLE_VALUE) { CloseHandle(cInW); cInW = INVALID_HANDLE_VALUE; }
-    if (abort->load() || !childDone) {
-        if (job) TerminateJobObject(job, 1);      // kills the whole tree
-        else TerminateProcess(pi.hProcess, 1);    // fallback if job setup failed
+    if (abort->load() || !childDone) kill_tree();
+    // if the process survives the wait (e.g. it ignored nothing but is stuck),
+    // don't let it leak: kill and reap once more
+    if (WaitForSingleObject(pi.hProcess, 3000) == WAIT_TIMEOUT) {
+        LOG("child still alive after 3s wait - killing");
+        kill_tree();
+        WaitForSingleObject(pi.hProcess, 1000);
     }
-    WaitForSingleObject(pi.hProcess, 3000);
     if (exec) {   // only exec has a meaningful exit code (interactive shells don't)
         DWORD code = 1;
         GetExitCodeProcess(pi.hProcess, &code);
@@ -231,7 +260,7 @@ void run_shell(ssh_channel ch, const AppConfig& cfg, bool exec, const std::strin
 }
 
 void shell_session(ssh_session s, App* app) {
-    auto keys = load_auth_keys(app->cfg.authorized_keys);
+    auto keys = load_auth_keys(app->authorized_keys_path());
     Auth a = authenticate(s, keys);
     free_keys(keys);
     if (!a.ok) { notify_unknown_key(app, a.fp); return; }
@@ -243,8 +272,14 @@ void shell_session(ssh_session s, App* app) {
 
     ssh_channel ch = accept_channel(s);
     if (!ch) return;
-    ChanReq rq = wait_channel_requests(s);
-    if (!rq.exec) send_motd(ch, *app);
-    run_shell(ch, app->cfg, rq.exec, rq.exec_cmd, abort);
+    ChanReq rq = wait_channel_requests(s, !a.opts.no_pty);
+
+    // a forced command replaces whatever the client asked for
+    bool exec = rq.exec;
+    std::string cmd = rq.exec_cmd;
+    if (!a.opts.forced_command.empty()) { exec = true; cmd = a.opts.forced_command; }
+
+    if (!exec) send_motd(ch, *app);
+    run_shell(ch, app->shell_dir(), exec, cmd, abort);
     ssh_channel_send_eof(ch); ssh_channel_close(ch); ssh_channel_free(ch);
 }

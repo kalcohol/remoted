@@ -43,8 +43,16 @@ void spawn_tracked(std::function<void()> fn);
 void join_tracked(DWORD budget_ms);
 
 // ---- auth (ssh_auth.cpp) ----
-struct AuthKey { ssh_key key; std::string comment; };
-struct Auth { bool ok = false; std::string fp; std::string comment; };
+// authorized_keys options we actually enforce. Anything else in the options
+// field is logged as ignored at load time (except the no-*-forwarding family,
+// which is inherently satisfied: remoted implements no forwarding at all).
+struct KeyOpts {
+    std::string forced_command;   // command="..."   -> replaces whatever the client asks to run
+    bool        no_pty = false;   // no-pty          -> pty requests are refused
+    std::string from;             // from="patterns" -> peer IP must match (wildcards * ?)
+};
+struct AuthKey { ssh_key key; std::string comment; KeyOpts opts; };
+struct Auth { bool ok = false; std::string fp; std::string comment; KeyOpts opts; };
 
 void ensure_host_key(const std::string& path);
 std::vector<AuthKey> load_auth_keys(const std::string& path);
@@ -54,16 +62,25 @@ Auth authenticate(ssh_session s, const std::vector<AuthKey>& keys);
 void notify_unknown_key(App* app, const std::string& fp);
 // fingerprint -> identities map; else the key's comment; else a short key id (never "unknown").
 std::string display_name(App* app, const Auth& a);
+// peer IPv4/IPv6 address of the session, "" if unavailable
+std::string peer_ip(ssh_session s);
+
+// one-shot channel write where failure only matters as a log line
+// (the channel is being closed right after anyway)
+inline void ch_write_str(ssh_channel ch, const std::string& s) {
+    if (ssh_channel_write(ch, s.data(), (uint32_t)s.size()) < 0)
+        LOG("channel write failed (%zu bytes)", s.size());
+}
 
 // ---- channel/session helpers (ssh_shell.cpp) ----
 ssh_channel accept_channel(ssh_session s);
 
 struct ChanReq { bool shell = false, exec = false; std::string exec_cmd; };
-ChanReq wait_channel_requests(ssh_session s);
+ChanReq wait_channel_requests(ssh_session s, bool allow_pty);
 
 void send_motd(ssh_channel ch, App& app);
 
-void run_shell(ssh_channel ch, const AppConfig& cfg, bool exec, const std::string& exec_cmd,
+void run_shell(ssh_channel ch, const std::string& shell_dir, bool exec, const std::string& exec_cmd,
                const std::shared_ptr<std::atomic<bool>>& abort);
 
 void shell_session(ssh_session s, App* app);

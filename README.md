@@ -110,6 +110,29 @@ Get-PnpDevice -Class Ports | Where-Object Status -eq 'OK' | ForEach-Object {
 ```
 Use the stable tail of `Parent` (e.g. `7&1895985a&0&0000`, or a real serial like `DK0EBG2H`).
 
+### `authorized_keys` options
+
+Standard per-key options are supported and **enforced**:
+
+```
+from="10.0.*,!10.0.13.37",no-pty ssh-ed25519 AAAA... alice
+command="burn.bat 0" ssh-ed25519 AAAA... burner-bot
+```
+
+- `command="..."` — forced command: replaces whatever the client asks to run on the
+  main shell. Keys with a forced command are **rejected on the serial consoles**.
+- `no-pty` — pty requests from this key are refused (remoted has no real pty anyway).
+- `from="patterns"` — peer IP must match the comma-separated list; `!` negates,
+  `*`/`?` are wildcards, first match decides, no match denies. CIDR (`a.b.c.d/n`) is
+  **not** implemented and never matches (fail closed — it is logged).
+- The `no-*-forwarding` family (`no-agent-forwarding`, `no-x11-forwarding`,
+  `no-port-forwarding`, `restrict`, `permitopen`, `permitlisten`) is inherently
+  satisfied — remoted implements no forwarding at all.
+- Any other option is **ignored and logged** at connect time — do not rely on it.
+
+Failed sessions are throttled per source IP: more than 10 failures within 60 s gets
+new connections from that address dropped early, and a bad signature costs a 1 s delay.
+
 ## Usage
 
 Control-machine `~/.ssh/config` (or `%USERPROFILE%\.ssh\config`):

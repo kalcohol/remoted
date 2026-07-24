@@ -100,7 +100,14 @@ static void poke_port(uint16_t port) {
     a.sin_family = AF_INET;
     a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     a.sin_port = htons(port);
-    connect(s, (struct sockaddr*)&a, sizeof(a));   // best-effort; unblocks accept
+    // non-blocking connect + a bounded wait: never hang the UI thread even if
+    // the stack is being weird (loopback normally completes instantly)
+    u_long nb = 1;
+    ioctlsocket(s, FIONBIO, &nb);
+    connect(s, (struct sockaddr*)&a, sizeof(a));
+    fd_set w; FD_ZERO(&w); FD_SET(s, &w);
+    timeval tv{ 0, 200 * 1000 };
+    select(0, nullptr, &w, nullptr, &tv);   // let the handshake complete -> wakes accept
     closesocket(s);
 }
 
@@ -182,10 +189,10 @@ static void bind_serial(App* app, std::string host, SerialCfg sc, std::string ho
 
 void ssh_start(App* app) {
     ssh_init();
-    ensure_host_key(app->cfg.host_key);
-    std::string host = app->cfg.listen_host;
-    std::string hk = app->cfg.host_key;
-    spawn_tracked([app, host, port = app->cfg.listen_port, hk]() { bind_main(app, host, port, hk); });
-    for (const auto& sc : app->cfg.serials)
+    ensure_host_key(app->host_key_path());
+    std::string host = app->listen_host();
+    std::string hk = app->host_key_path();
+    spawn_tracked([app, host, port = app->listen_port(), hk]() { bind_main(app, host, port, hk); });
+    for (const auto& sc : app->serial_cfgs())
         spawn_tracked([app, host, sc, hk]() { bind_serial(app, host, sc, hk); });
 }

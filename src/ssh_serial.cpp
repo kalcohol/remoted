@@ -38,7 +38,7 @@ void bridge_release(const std::string& name, const std::shared_ptr<Attach>& a) {
 }
 
 void serial_session(ssh_session s, const SerialCfg sc, App* app) {
-    auto keys = load_auth_keys(app->cfg.authorized_keys);
+    auto keys = load_auth_keys(app->authorized_keys_path());
     Auth a = authenticate(s, keys);
     free_keys(keys);
     if (!a.ok) { notify_unknown_key(app, a.fp); return; }
@@ -51,25 +51,28 @@ void serial_session(ssh_session s, const SerialCfg sc, App* app) {
 
     ssh_channel ch = accept_channel(s);
     if (!ch) return;
-    ChanReq rq = wait_channel_requests(s);
+    ChanReq rq = wait_channel_requests(s, !a.opts.no_pty);
+
+    if (!a.opts.forced_command.empty()) {   // a forced-command key has no business on a console
+        ch_write_str(ch, "remoted: this key is restricted to a forced command.\r\n");
+        ssh_channel_send_eof(ch); ssh_channel_close(ch); ssh_channel_free(ch);
+        return;   // guard releases occupancy
+    }
 
     if (rq.exec) {   // serial ports are interactive consoles; exec makes no sense
-        const char* m = "remoted: serial ports are interactive-only.\r\n"
-                        "Connect without a command:  ssh -p <port> <host>\r\n";
-        ssh_channel_write(ch, m, (uint32_t)strlen(m));
+        ch_write_str(ch, "remoted: serial ports are interactive-only.\r\n"
+                         "Connect without a command:  ssh -p <port> <host>\r\n");
         ssh_channel_send_eof(ch); ssh_channel_close(ch); ssh_channel_free(ch);
         return;   // guard releases occupancy
     }
 
     std::string com = app->find_com_for(sc.name);
     if (com.empty()) {
-        const char* m = "remoted: serial port not present on this host\r\n";
-        ssh_channel_write(ch, m, (uint32_t)strlen(m));
+        ch_write_str(ch, "remoted: serial port not present on this host\r\n");
     } else {
         auto b = bridge_attach(sc, com);
         if (!b) {
-            const char* m = "remoted: cannot open serial port\r\n";
-            ssh_channel_write(ch, m, (uint32_t)strlen(m));
+            ch_write_str(ch, "remoted: cannot open serial port\r\n");
         } else {
             auto at = b->attach(ch);
             char buf[4096];
@@ -89,7 +92,10 @@ void serial_session(ssh_session s, const SerialCfg sc, App* app) {
                     popped.reserve(at->outq.size());
                     while (!at->outq.empty()) { popped.emplace_back(std::move(at->outq.front())); at->outq.pop_front(); }
                 }
-                for (const auto& ss : popped) ssh_channel_write(ch, ss.data(), (uint32_t)ss.size());
+                bool dead = false;
+                for (const auto& ss : popped)
+                    if (ssh_channel_write(ch, ss.data(), (uint32_t)ss.size()) < 0) { dead = true; break; }
+                if (dead) break;
                 if (ssh_channel_is_eof(ch) || ssh_channel_is_closed(ch)) break;
                 if (avail == 0) Sleep(5);
             }
