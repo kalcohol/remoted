@@ -100,18 +100,21 @@ void serial_session(ssh_session s, const SerialCfg sc, App* app) {
     if (!app->serial_cfg_for(sc.name, cur))
         return refuse("remoted: this serial was removed from the config\r\n");
 
-    int tok = app->session_start(sc.name, who);
-    app->mark_busy(sc.name, tok, who);
-    Guard g([&]() { app->clear_busy(sc.name, tok); unreg_abort(abort); app->session_end(tok); });
-
+    // occupancy is registered only once the console is actually usable: a
+    // connection the server is about to refuse must not flash the overlay
     std::string com = app->find_com_for(sc.name);
     if (com.empty()) {
         ch_write_str(ch, "remoted: serial port not present on this host\r\n");
+        unreg_abort(abort);
     } else {
         auto b = bridge_attach(cur, com);
         if (!b) {
             ch_write_str(ch, "remoted: cannot open serial port (absent, busy, or config changed while in use)\r\n");
+            unreg_abort(abort);
         } else {
+            int tok = app->session_start(sc.name, who);
+            app->mark_busy(sc.name, tok, who);
+            Guard g([&]() { app->clear_busy(sc.name, tok); unreg_abort(abort); app->session_end(tok); });
             std::shared_ptr<Attach> at;
             try {
                 at = b->attach(ch);

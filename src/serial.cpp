@@ -37,15 +37,19 @@ bool SerialPort::open(const std::string& com, uint32_t baud) {
         close();
         return false;
     }
-    // MAXDWORD interval + zero totals would complete EVERY read immediately
-    // (0 bytes included) and spin the reader at 100% CPU. The documented
-    // pattern for "return at once if bytes are buffered, otherwise wait up to
-    // N ms" is MAXDWORD interval + zero multiplier + N as the constant - which
-    // is exactly our 100ms poll cadence, enforced driver-side.
+    // Documented "return at once if bytes are buffered, otherwise wait up to
+    // N ms" pattern: interval=MAXDWORD AND multiplier=MAXDWORD AND 0<N<MAXDWORD
+    // (MAXDWORD/0/0 would spin at 100% CPU; MAXDWORD/0/N would batch every read
+    // to N ms). N = our 100ms poll cadence, enforced driver-side.
     COMMTIMEOUTS to{};
     to.ReadIntervalTimeout = MAXDWORD;
+    to.ReadTotalTimeoutMultiplier = MAXDWORD;
     to.ReadTotalTimeoutConstant = 100;
-    SetCommTimeouts(h_, &to);
+    if (!SetCommTimeouts(h_, &to)) {
+        LOG("serial SetCommTimeouts failed %s err=%lu", com.c_str(), GetLastError());
+        close();
+        return false;
+    }
     PurgeComm(h_, PURGE_RXCLEAR | PURGE_TXCLEAR);
     LOG("serial opened %s @%u", com.c_str(), baud);
     return true;

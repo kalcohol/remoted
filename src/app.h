@@ -82,6 +82,7 @@ public:
     std::wstring overlay_text() const;
 private:
     AppConfig                cfg_;       // swapped under m_ by reload()
+    mutable std::mutex       refresh_m_; // serializes refresh() (enumeration is NOT under m_)
     mutable std::vector<EnumCom>     devs_;    // refreshed on demand by refresh()
     mutable std::mutex       m_;
     std::atomic<int>         next_token_{1};

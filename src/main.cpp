@@ -69,7 +69,11 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
     // singleton), so it is parked in a static; the OS reclaims it at exit.
     static HANDLE g_single = nullptr;
     g_single = CreateMutexW(nullptr, TRUE, L"Local\\remoted-singleton-v1");
-    if (GetLastError() == ERROR_ALREADY_EXISTS) {
+    if (!g_single) {
+        // object-manager/ACL failure: log it and keep running (a port clash
+        // with a real second instance is caught later by the bind failure)
+        LOG("single-instance mutex failed err=%lu - continuing anyway", GetLastError());
+    } else if (GetLastError() == ERROR_ALREADY_EXISTS) {
         HWND h = FindWindowW(L"remoted_tray", nullptr);
         if (h) PostMessageW(h, WM_APP_BALLOON, 0, 0);
         LOG("another instance is running - exiting");

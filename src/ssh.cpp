@@ -34,6 +34,7 @@ struct SshStatics {
     std::mutex ports_m;
     std::vector<uint16_t> ports;
     std::string bind_host;
+    std::map<std::string, uint16_t> serial_binds;   // serial name -> live listen port
 };
 }
 static SshStatics& S() { static auto* p = new SshStatics(); return *p; }
@@ -240,7 +241,14 @@ static void bind_main(App* app, std::string host, uint16_t port, std::string hos
 static void bind_serial(App* app, std::string host, SerialCfg sc, std::string hostkey) {
     ssh_bind b = make_bind(host, sc.listen_port, hostkey);
     if (!b) { app->request_notify(L"remoted", L"failed to listen on :" + std::to_wstring(sc.listen_port) + L" (" + utf8_to_wide(sc.name) + L")"); return; }
+    { std::lock_guard<std::mutex> lk(S().ports_m); S().serial_binds[sc.name] = sc.listen_port; }
     accept_loop(b, app, [sc](ssh_session s, App* a) { serial_session(s, sc, a); });
+}
+
+uint16_t ssh_serial_bound_port(const std::string& name) {
+    std::lock_guard<std::mutex> lk(S().ports_m);
+    auto it = S().serial_binds.find(name);
+    return it == S().serial_binds.end() ? 0 : it->second;
 }
 
 void ssh_start(App* app) {

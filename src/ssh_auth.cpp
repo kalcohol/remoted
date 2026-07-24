@@ -295,12 +295,15 @@ Auth authenticate(ssh_session s, const std::vector<AuthKey>& keys,
         LOG("auth: %s throttled (too many recent failures) - dropping", ip.c_str());
         return { false, "", "" };
     }
+    const ULONGLONG deadline = GetTickCount64() + 60000;   // LoginGraceTime-style wall clock:
     int budget = 32;      // hard cap on processed auth messages (brute-force protection)
     while (true) {
         if (abort && abort->load())   // disconnect-all / shutdown: not an auth failure
             return { false, "", "" };
-        if (budget-- <= 0) {
-            LOG("auth attempt limit reached; dropping connection");
+        // a message budget alone is not enough: a slow-drip client sending one
+        // junk message per timeout window would hold a worker slot for ~30min
+        if (budget-- <= 0 || GetTickCount64() >= deadline) {
+            LOG("auth budget exhausted (messages or time); dropping connection");
             break;
         }
         msg = ssh_message_get(s);

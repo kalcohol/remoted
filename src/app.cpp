@@ -1,4 +1,5 @@
 #include "app.h"
+#include "ssh.h"
 #include "util.h"
 #include "log.h"
 #include <algorithm>
@@ -54,10 +55,14 @@ void App::start() {
 }
 
 void App::refresh() const {
-    // serialize the WHOLE refresh: concurrent refreshers (UI timer vs ssh
-    // worker) must not let an older enumeration overwrite a newer rebuild
+    // serialize refreshers against each other on refresh_m_, but do the slow
+    // setupapi enumeration OUTSIDE m_ (holding the config lock across an I/O-
+    // style syscall stalls every config reader). Serialization order doubles as
+    // freshness order, so an older enumeration can't overwrite a newer rebuild.
+    std::lock_guard<std::mutex> rl(refresh_m_);
+    auto devs = enumerate_com_ports();
     std::lock_guard<std::mutex> lk(m_);
-    devs_ = enumerate_com_ports();
+    devs_ = std::move(devs);
     std::vector<SerialStatus> rebuilt;
     for (const auto& s : cfg_.serials) {
         SerialStatus st;
@@ -118,9 +123,18 @@ bool App::reload() {
             for (const auto& os : cfg_.serials)
                 if (os.name == ns.name) { old = &os; break; }
             if (!old) {
-                LOG("reload: serial '%s' is new - its listener needs a restart", ns.name.c_str());
-                // don't advertise a port nobody listens on (MOTD/Status show :0)
-                ns.listen_port = 0;
+                uint16_t bound = ssh_serial_bound_port(ns.name);
+                if (bound) {
+                    // deleted-then-re-added: the OLD listener is still alive -
+                    // advertise the port that actually works
+                    LOG("reload: serial '%s' re-added - keeping live listener :%u",
+                        ns.name.c_str(), (unsigned)bound);
+                    ns.listen_port = bound;
+                } else {
+                    LOG("reload: serial '%s' is new - its listener needs a restart", ns.name.c_str());
+                    // don't advertise a port nobody listens on (MOTD/Status show :0)
+                    ns.listen_port = 0;
+                }
             } else if (old->listen_port != ns.listen_port) {
                 LOG("reload: serial '%s' listen port changes require restart - keeping :%u",
                     ns.name.c_str(), (unsigned)old->listen_port);

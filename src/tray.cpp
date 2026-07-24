@@ -218,10 +218,16 @@ LRESULT CALLBACK Tray::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             break;
         }
         case IDM_RELOAD:
-            if (app->reload())
+            if (app->reload()) {
                 self->show_balloon(L"remoted", L"config reloaded (listen port changes need restart)");
-            else
+                // re-evaluate overlay visibility/text now (enabled may have been
+                // toggled, message may have changed) instead of waiting for the
+                // next session event
+                PostMessageW(h, WM_APP_STATE, 0, 0);
+                PostMessageW(h, WM_APP_REFRESH, 0, 0);
+            } else {
                 self->show_balloon(L"remoted", L"config parse FAILED - kept the previous config");
+            }
             break;
         case IDM_EXIT:
             Shell_NotifyIconW(NIM_DELETE, &self->nid_);

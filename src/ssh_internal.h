@@ -140,6 +140,8 @@ struct SerialBridge : std::enable_shared_from_this<SerialBridge> {
                         a->outq.push_back(chunk);
                     }
                 } else if (n < 0) { LOG("serial %s: read error", self->name.c_str()); break; }
+                else Sleep(1);   // belt & braces: a quirky driver that completes
+                                 // reads instantly must not spin this thread
             }
             // reader is gone (device error or stop): mark the bridge dead and tell
             // every attached session, so nobody sits on a silent console and no
