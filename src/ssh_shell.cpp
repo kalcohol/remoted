@@ -363,7 +363,7 @@ void run_shell(ssh_channel ch, const std::string& shell_dir, bool exec, const st
         // on a handle it doesn't own
         if (WaitForSingleObject(R.hProcess, 0) == WAIT_OBJECT_0) {
             for (int i = 0; i < 20; ++i) {
-                drain();
+                if (!drain()) break;   // channel died too - no point waiting
                 { std::lock_guard<std::mutex> lk(Q_->m); childDone = Q_->eof; }
                 if (childDone) break;
                 Sleep(50);

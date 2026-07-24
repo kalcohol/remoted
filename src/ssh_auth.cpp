@@ -194,11 +194,13 @@ bool wild_match(const std::string& pat, const std::string& str) {
 static bool cidr4_match(const std::string& pat, const std::string& ip) {
     auto slash = pat.find('/');
     std::string suffix = pat.substr(slash + 1);
+    // require a plain decimal number: strtol alone would accept "+24"/" 24",
+    // and atoi would turn "/abc" or "/" into /0 = match-any-IPv4, silently
+    // WIDENING an authorization rule
+    if (suffix.empty() || suffix[0] < '0' || suffix[0] > '9') return false;
     char* end = nullptr;
     long bits = strtol(suffix.c_str(), &end, 10);
-    // the whole suffix must be a number in range: atoi would turn "/abc" or
-    // "/" into /0 = match-any-IPv4, silently WIDENING an authorization rule
-    if (suffix.empty() || !end || *end != '\0' || bits < 0 || bits > 32) return false;
+    if (!end || *end != '\0' || bits < 0 || bits > 32) return false;
     in_addr base{}, addr{};
     if (inet_pton(AF_INET, pat.substr(0, slash).c_str(), &base) != 1) return false;
     if (inet_pton(AF_INET, ip.c_str(), &addr) != 1) return false;
