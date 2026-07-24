@@ -203,7 +203,8 @@ static void accept_loop(ssh_bind b, App* app, std::function<void(ssh_session, Ap
             ssh_disconnect(s); ssh_free(s);
             continue;
         }
-        spawn_tracked([s, app, fn]() {
+        try {
+            spawn_tracked([s, app, fn]() {
             try {
                 // a silent/half-open connection will time out instead of
                 // pinning a thread forever.
@@ -219,6 +220,13 @@ static void accept_loop(ssh_bind b, App* app, std::function<void(ssh_session, Ap
             ssh_disconnect(s); ssh_free(s);
             S().sessions--;   // spawn_tracked guarantees we always get here
         });
+        } catch (...) {
+            // std::thread construction failed (resource pressure): release the
+            // reserved slot and the session, keep this listener alive
+            LOG("worker spawn failed - dropping connection");
+            S().sessions--;
+            ssh_disconnect(s); ssh_free(s);
+        }
     }
     ssh_bind_free(b);
 }

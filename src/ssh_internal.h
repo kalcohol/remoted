@@ -119,9 +119,11 @@ struct SerialBridge : std::enable_shared_from_this<SerialBridge> {
     void start_reader() {
         auto self = shared_from_this();
         reader = std::thread([self]() {
-            char b[4096]; int n; long total = 0; bool logged = false;
+            // driver-side timeout is 100ms (COMMTIMEOUTS); the user-space wait
+            // gets extra headroom so it only fires when the driver misbehaves
+            char b[4096]; int n; uint64_t total = 0; bool logged = false;
             while (!self->stop) {
-                n = self->sp.read(b, sizeof b, 100);
+                n = self->sp.read(b, sizeof b, 250);
                 if (n > 0) {
                     total += n;
                     if (!logged) { LOG("serial %s: first data %d bytes", self->name.c_str(), n); logged = true; }
@@ -145,7 +147,7 @@ struct SerialBridge : std::enable_shared_from_this<SerialBridge> {
             self->stop = true;
             { std::lock_guard<std::mutex> lk(self->att_m);
               for (auto& a : self->attaches) a->dead = true; }
-            LOG("serial %s: reader stopped, total %ld bytes", self->name.c_str(), total);
+            LOG("serial %s: reader stopped, total %llu bytes", self->name.c_str(), (unsigned long long)total);
         });
     }
     std::shared_ptr<Attach> attach(ssh_channel ch) {

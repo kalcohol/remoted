@@ -37,12 +37,14 @@ bool SerialPort::open(const std::string& com, uint32_t baud) {
         close();
         return false;
     }
-    // MAXDWORD interval + zero totals: a read completes IMMEDIATELY with
-    // whatever bytes are buffered (possibly 0). All-zero would be the opposite
-    // of what we want - the IRP would wait for the FULL buffer, our 100ms poll
-    // would CancelIo every cycle and drop partially received bytes.
+    // MAXDWORD interval + zero totals would complete EVERY read immediately
+    // (0 bytes included) and spin the reader at 100% CPU. The documented
+    // pattern for "return at once if bytes are buffered, otherwise wait up to
+    // N ms" is MAXDWORD interval + zero multiplier + N as the constant - which
+    // is exactly our 100ms poll cadence, enforced driver-side.
     COMMTIMEOUTS to{};
     to.ReadIntervalTimeout = MAXDWORD;
+    to.ReadTotalTimeoutConstant = 100;
     SetCommTimeouts(h_, &to);
     PurgeComm(h_, PURGE_RXCLEAR | PURGE_TXCLEAR);
     LOG("serial opened %s @%u", com.c_str(), baud);

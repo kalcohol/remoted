@@ -102,9 +102,10 @@ AppConfig load_config(const std::string& path, bool* ok) {
     c.overlay.retract_delay_sec = ov.value("retract_delay_sec", 3);
     c.overlay.message          = ov.value("message", std::string(""));
     if (c.overlay.retract_delay_sec < 1 || c.overlay.retract_delay_sec > 3600) {
-        LOG("config: retract_delay_sec %d out of range - clamped to [1,3600]",
-            c.overlay.retract_delay_sec);
-        c.overlay.retract_delay_sec = c.overlay.retract_delay_sec < 1 ? 3 : 3600;
+        int clamped = c.overlay.retract_delay_sec < 1 ? 3 : 3600;
+        LOG("config: retract_delay_sec %d out of range - using %d",
+            c.overlay.retract_delay_sec, clamped);
+        c.overlay.retract_delay_sec = clamped;
     }
 
     if (j.contains("identities") && j["identities"].is_object()) {

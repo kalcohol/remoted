@@ -21,7 +21,7 @@ static LONG WINAPI veh_handler(PEXCEPTION_POINTERS ep) {
     DWORD code = ep->ExceptionRecord->ExceptionCode;
     // ignore benign / first-chance "exceptions":
     //  0xE06D7363         C++ exception
-    //  0x40010005/0006    OutputDebugString (wide/ansi) - raised by logging itself
+    //  0x40010005/0006    debugger control / OutputDebugString - raised by logging
     //  EXCEPTION_BREAKPOINT / SINGLE_STEP
     if (code == 0xE06D7363) return EXCEPTION_CONTINUE_SEARCH;
     if (code == 0x40010005 || code == 0x40010006) return EXCEPTION_CONTINUE_SEARCH;

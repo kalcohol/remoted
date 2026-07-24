@@ -118,8 +118,9 @@ bool App::reload() {
             for (const auto& os : cfg_.serials)
                 if (os.name == ns.name) { old = &os; break; }
             if (!old) {
-                LOG("reload: serial '%s' is new - listen port changes require restart",
-                    ns.name.c_str());
+                LOG("reload: serial '%s' is new - its listener needs a restart", ns.name.c_str());
+                // don't advertise a port nobody listens on (MOTD/Status show :0)
+                ns.listen_port = 0;
             } else if (old->listen_port != ns.listen_port) {
                 LOG("reload: serial '%s' listen port changes require restart - keeping :%u",
                     ns.name.c_str(), (unsigned)old->listen_port);
@@ -201,7 +202,7 @@ void App::session_end(int token) {
     bool zero = false;
     {
         std::lock_guard<std::mutex> lk(m_);
-        holders_.erase(token);
+        if (holders_.erase(token) == 0) return;   // unknown token: nothing to end
         if (active_ > 0) active_--;
         zero = (active_ == 0);
     }
@@ -241,13 +242,6 @@ void App::request_notify(const std::wstring& title, const std::wstring& body) {
         pending_notify_.emplace_back(title, body);
     }
     if (hwnd_main) PostMessage(hwnd_main, WM_APP_NOTIFY, 0, 0);
-}
-
-std::vector<std::string> App::shell_holders() const {
-    std::lock_guard<std::mutex> lk(m_);
-    std::vector<std::string> r;
-    for (const auto& kv : holders_) if (kv.second.first == "shell") r.push_back(kv.second.second);
-    return r;
 }
 
 std::wstring App::overlay_text() const {

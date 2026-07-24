@@ -67,7 +67,6 @@ public:
     int  session_start(const std::string& scope, const std::string& display_name);
     void session_end(int token);
     int  active_count() const;         // live session count (UI reads this, not msg payloads)
-    std::vector<std::string> shell_holders() const;
 
     // serial hold registry (status only; sharing is handled by the ssh layer).
     // keyed by session token so two sessions of the same name don't clobber each other.

@@ -43,10 +43,10 @@ std::shared_ptr<SerialBridge> bridge_attach(const SerialCfg& sc, const std::stri
     auto b = std::make_shared<SerialBridge>();
     b->name = sc.name; b->com = com; b->baud = sc.baud;
     if (!b->sp.open(com, sc.baud)) { LOG("bridge open failed %s (%s)", sc.name.c_str(), com.c_str()); return nullptr; }
+    b->start_reader();   // BEFORE registering/ref: a throwing std::thread must not leave a half-dead bridge
     LOG("bridge opened %s (%s) @%u", sc.name.c_str(), com.c_str(), sc.baud);
     B().bridges[sc.name] = b;
     b->ref++;
-    b->start_reader();
     return b;
 }
 
@@ -112,7 +112,13 @@ void serial_session(ssh_session s, const SerialCfg sc, App* app) {
         if (!b) {
             ch_write_str(ch, "remoted: cannot open serial port (absent, busy, or config changed while in use)\r\n");
         } else {
-            auto at = b->attach(ch);
+            std::shared_ptr<Attach> at;
+            try {
+                at = b->attach(ch);
+            } catch (...) {   // make_shared failed: don't leak the bridge ref
+                bridge_release(b, nullptr);
+                throw;
+            }
             Guard bg([&]() { bridge_release(b, at); });   // exceptions must not leak the ref
             char buf[4096];
             while (true) {

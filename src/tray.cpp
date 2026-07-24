@@ -132,9 +132,13 @@ LRESULT CALLBACK Tray::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         // overlay while sessions are still live
         int active = app ? app->active_count() : 0;
         OverlayCfg oc = app ? app->overlay_cfg() : OverlayCfg{};   // range-clamped at load
-        if (app && oc.enabled && ov) {
+        if (app && oc.enabled && ov && ov->hwnd()) {
             if (active > 0) { ov->show_now(); KillTimer(h, TIMER_RETRACT); }
             else SetTimer(h, TIMER_RETRACT, oc.retract_delay_sec * 1000, nullptr);
+        } else if (ov && ov->hwnd() && IsWindowVisible(ov->hwnd())) {
+            // overlay got disabled via Reload while visible: retract it now,
+            // the timer path above is gone for good
+            ov->hide_now();
         }
         return 0;
     }
@@ -205,7 +209,7 @@ LRESULT CALLBACK Tray::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             else self->show_balloon(L"remoted", L"overlay unavailable (creation failed at startup)");
             break;
         case IDM_CFG: {
-            std::wstring p = utf8_to_wide(app->config_path);
+            std::wstring p = L"\"" + utf8_to_wide(app->config_path) + L"\"";   // exe dir may contain spaces
             HINSTANCE r = ShellExecuteW(h, L"open", L"notepad.exe", p.c_str(), nullptr, SW_SHOWNORMAL);
             if ((INT_PTR)r <= 32) {   // ShellExecute returns <= 32 on failure
                 LOG("open config in notepad failed (%d)", (int)(INT_PTR)r);
@@ -230,6 +234,7 @@ LRESULT CALLBACK Tray::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_DESTROY:
         KillTimer(h, TIMER_RETRACT);
         KillTimer(h, TIMER_PNP);
+        if (self) Shell_NotifyIconW(NIM_DELETE, &self->nid_);   // no ghost icon on taskkill
         PostQuitMessage(0);
         return 0;
     }

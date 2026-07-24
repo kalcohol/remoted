@@ -110,15 +110,33 @@ void Overlay::layout(int w, int h) {
     MoveWindow(htext_, w / 10, by - scale(280), w - w / 5, scale(260), TRUE);
 }
 
+// union of every monitor's PHYSICAL pixel rect: under PerMonitorV2 the
+// SM_*VIRTUALSCREEN metrics are reported in system-DPI coordinates, which
+// under-covers the desktop on mixed-DPI multi-monitor setups
+static RECT virtual_screen_rect() {
+    RECT u{ 0, 0, 0, 0 };
+    EnumDisplayMonitors(nullptr, nullptr, [](HMONITOR, HDC, LPRECT r, LPARAM p) -> BOOL {
+        RECT* u = (RECT*)p;
+        UnionRect(u, u, r);
+        return TRUE;
+    }, (LPARAM)&u);
+    if (u.right <= u.left || u.bottom <= u.top) {   // no monitors?? fall back
+        u.left = GetSystemMetrics(SM_XVIRTUALSCREEN);
+        u.top = GetSystemMetrics(SM_YVIRTUALSCREEN);
+        u.right = u.left + GetSystemMetrics(SM_CXVIRTUALSCREEN);
+        u.bottom = u.top + GetSystemMetrics(SM_CYVIRTUALSCREEN);
+    }
+    return u;
+}
+
 void Overlay::show_now() {
+    if (!hwnd_) return;   // creation failed at startup
     UINT dpi = GetDpiForWindow(hwnd_);
     if (dpi != dpi_) make_fonts(dpi);   // moved to a different-DPI monitor
     SetWindowTextW(htext_, app_->overlay_text().c_str());
-    int x = GetSystemMetrics(SM_XVIRTUALSCREEN);
-    int y = GetSystemMetrics(SM_YVIRTUALSCREEN);
-    int w = GetSystemMetrics(SM_CXVIRTUALSCREEN);
-    int h = GetSystemMetrics(SM_CYVIRTUALSCREEN);
-    MoveWindow(hwnd_, x, y, w, h, TRUE);
+    RECT v = virtual_screen_rect();
+    int w = v.right - v.left, h = v.bottom - v.top;
+    MoveWindow(hwnd_, v.left, v.top, w, h, TRUE);
     layout(w, h);
     ShowWindow(hwnd_, SW_SHOWNA);   // show WITHOUT stealing focus
     SetWindowPos(hwnd_, HWND_TOPMOST, 0, 0, 0, 0,
@@ -126,5 +144,6 @@ void Overlay::show_now() {
 }
 
 void Overlay::hide_now() {
+    if (!hwnd_) return;
     ShowWindow(hwnd_, SW_HIDE);
 }

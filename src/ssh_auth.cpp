@@ -181,7 +181,10 @@ std::vector<AuthKey> load_auth_keys(const std::string& path) {
         auto t = tokenize_quoted(line);
         size_t ki = t.size();
         for (size_t i = 0; i < t.size(); ++i) if (is_keytype(t[i].text)) { ki = i; break; }
-        if (ki == t.size() || ki + 1 >= t.size()) continue;   // no type + base64
+        if (ki == t.size() || ki + 1 >= t.size()) {   // no type + base64
+            LOG("authorized_keys:%d: no key type found - line skipped", lineno);
+            continue;
+        }
         const std::string& type = t[ki].text;
         const std::string& b64 = t[ki + 1].text;
         std::string comment;
@@ -225,22 +228,31 @@ std::string key_fp(ssh_key k) {
 struct AuthStatics {
     std::mutex nf_m;
     std::set<std::string> notified_fp;                          // fps we already ballooned about
+    ULONGLONG last_notify = 0;                                  // balloon rate limit
     std::mutex ip_m;
     std::map<std::string, std::pair<int, ULONGLONG>> ip_fails;  // ip -> {fails, window start}
 };
 static AuthStatics& A() { static auto* p = new AuthStatics(); return *p; }
 
 // Notify once per fingerprint when a session ultimately fails to authenticate.
+// The balloon itself is rate-limited (60s): a flood of random keys must not
+// spam the operator's screen even as the dedup set rotates. Logs are unlimited.
 void notify_unknown_key(App* app, const std::string& fp) {
     if (!app || fp.empty()) return;
     bool do_notify = false;
     { std::lock_guard<std::mutex> lk(A().nf_m);
       auto& seen = A().notified_fp;
       if (seen.size() >= 64) seen.clear();      // cap: evict all rather than going silent forever
-      if (seen.insert(fp).second) do_notify = true; }
+      ULONGLONG now = GetTickCount64();
+      if (seen.insert(fp).second && now - A().last_notify > 60000) {
+          A().last_notify = now;
+          do_notify = true;
+      } }
     if (do_notify) {
-        LOG("auth failed; last offered key: %s", fp.c_str());
+        LOG("auth failed; last offered key: %s (balloon)", fp.c_str());
         app->request_notify(L"unknown key rejected", utf8_to_wide(fp));
+    } else {
+        LOG("auth failed; last offered key: %s", fp.c_str());
     }
 }
 
@@ -284,8 +296,13 @@ Auth authenticate(ssh_session s, const std::vector<AuthKey>& keys,
         return { false, "", "" };
     }
     int budget = 32;      // hard cap on processed auth messages (brute-force protection)
-    while (budget-- > 0) {
-        if (abort && abort->load()) break;   // disconnect-all / shutdown
+    while (true) {
+        if (abort && abort->load())   // disconnect-all / shutdown: not an auth failure
+            return { false, "", "" };
+        if (budget-- <= 0) {
+            LOG("auth attempt limit reached; dropping connection");
+            break;
+        }
         msg = ssh_message_get(s);
         if (!msg) break;
         int t = ssh_message_type(msg), st = ssh_message_subtype(msg);
@@ -344,7 +361,6 @@ Auth authenticate(ssh_session s, const std::vector<AuthKey>& keys,
         }
         ssh_message_free(msg);
     }
-    if (budget <= 0) LOG("auth attempt limit reached; dropping connection");
     if (!fail_counted) ip_record_fail(ip);   // every exit here is a failed session
     return { false, lastFp, "" };
 }

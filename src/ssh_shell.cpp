@@ -356,18 +356,22 @@ void shell_session(ssh_session s, App* app) {
     if (!a.ok) { unreg_abort(abort); notify_unknown_key(app, a.fp); return; }
     std::string who = display_name(app, a);
     LOG("shell session auth ok: %s (%s)", who.c_str(), a.fp.c_str());
-    int tok = app->session_start("shell", who);
-    Guard g([&]() { unreg_abort(abort); app->session_end(tok); });
 
     ssh_channel ch = accept_channel(s);
-    if (!ch) return;
+    if (!ch) { unreg_abort(abort); return; }
     ChanReq rq = wait_channel_requests(s, !a.opts.no_pty);
 
     if (!rq.shell && !rq.exec) {   // client asked for neither (or stalled past the budget)
         ch_write_str(ch, "remoted: no shell or exec requested\r\n");
         ssh_channel_send_eof(ch); ssh_channel_close(ch); ssh_channel_free(ch);
-        return;   // guard releases occupancy
+        unreg_abort(abort);
+        return;
     }
+
+    // register occupancy only once we know the session is real (mirrors the
+    // serial side: a refused/stalled connection must not flash the overlay)
+    int tok = app->session_start("shell", who);
+    Guard g([&]() { unreg_abort(abort); app->session_end(tok); });
 
     // a forced command replaces whatever the client asked for
     bool exec = rq.exec;
