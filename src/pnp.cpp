@@ -48,8 +48,8 @@ std::vector<EnumCom> enumerate_com_ports() {
         if (ws.empty()) {   // fallback for odd drivers
             wchar_t fname[256] = {};
             if (SetupDiGetDeviceRegistryPropertyW(h, &d, SPDRP_FRIENDLYNAME,
-                    nullptr, (PBYTE)fname, sizeof(fname), nullptr))
-                ws = fname;
+                    nullptr, (PBYTE)fname, sizeof(fname) - sizeof(wchar_t), nullptr))
+                ws = fname;   // -1 wchar: guaranteed NUL-terminated even if full
         }
         std::wsmatch m;
         if (!std::regex_search(ws, m, re_com)) continue;

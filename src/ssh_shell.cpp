@@ -271,6 +271,10 @@ void run_shell(ssh_channel ch, const std::string& shell_dir, bool exec, const st
     R.reader = std::thread([cOutR = R.cOutR, readEv = R.readEv, stopEv = R.stopEv, Q_, oemCarry]() {
         char b[8192]; DWORD n;
         for (;;) {
+            // a saturated pipe makes every ReadFile complete synchronously -
+            // without this check the pending-branch below never runs and a
+            // stop request would never be seen
+            if (WaitForSingleObject(stopEv, 0) == WAIT_OBJECT_0) break;
             OVERLAPPED ov{}; ov.hEvent = readEv;
             ResetEvent(readEv);
             BOOL ok = ReadFile(cOutR, b, sizeof b, &n, &ov);
@@ -352,6 +356,20 @@ void run_shell(ssh_channel ch, const std::string& shell_dir, bool exec, const st
         { std::lock_guard<std::mutex> lk(Q_->m); childDone = Q_->eof; }
         if (childDone) { drain(); break; }
         if (ssh_channel_is_closed(ch)) break;
+
+        // the child itself exited but the pipe hasn't hit EOF: a grandchild
+        // (start /b ...) inherited the write end. Give the reader a 1s grace
+        // to deliver residual output, then leave - the session must not hang
+        // on a handle it doesn't own
+        if (WaitForSingleObject(R.hProcess, 0) == WAIT_OBJECT_0) {
+            for (int i = 0; i < 20; ++i) {
+                drain();
+                { std::lock_guard<std::mutex> lk(Q_->m); childDone = Q_->eof; }
+                if (childDone) break;
+                Sleep(50);
+            }
+            break;
+        }
     }
 
     if (R.cInW != INVALID_HANDLE_VALUE) { CloseHandle(R.cInW); R.cInW = INVALID_HANDLE_VALUE; }

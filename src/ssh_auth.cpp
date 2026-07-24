@@ -52,7 +52,10 @@ static void restrict_file_acl(const std::string& path) {
 void ensure_host_key(const std::string& path) {
     ssh_key k = nullptr;
     if (ssh_pki_import_privkey_file(path.c_str(), nullptr, nullptr, nullptr, &k) == SSH_OK) {
-        ssh_key_free(k); LOG("host key present: %s", path.c_str()); return;
+        ssh_key_free(k);
+        LOG("host key present: %s", path.c_str());
+        restrict_file_acl(path);   // a manually copied-in key may carry a wide ACL
+        return;
     }
     auto pos = path.find_last_of("/\\");
     if (pos != std::string::npos) ensure_dir(path.substr(0, pos));
@@ -190,9 +193,13 @@ bool wild_match(const std::string& pat, const std::string& str) {
 // IPv4 CIDR match ("a.b.c.d/n"); false on anything unparseable (fail closed)
 static bool cidr4_match(const std::string& pat, const std::string& ip) {
     auto slash = pat.find('/');
+    std::string suffix = pat.substr(slash + 1);
+    char* end = nullptr;
+    long bits = strtol(suffix.c_str(), &end, 10);
+    // the whole suffix must be a number in range: atoi would turn "/abc" or
+    // "/" into /0 = match-any-IPv4, silently WIDENING an authorization rule
+    if (suffix.empty() || !end || *end != '\0' || bits < 0 || bits > 32) return false;
     in_addr base{}, addr{};
-    int bits = atoi(pat.c_str() + slash + 1);
-    if (bits < 0 || bits > 32) return false;
     if (inet_pton(AF_INET, pat.substr(0, slash).c_str(), &base) != 1) return false;
     if (inet_pton(AF_INET, ip.c_str(), &addr) != 1) return false;
     uint32_t b = ntohl(base.s_addr), a = ntohl(addr.s_addr);
