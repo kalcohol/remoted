@@ -18,6 +18,9 @@ add_executable(remoted WIN32
   src/overlay.cpp
   src/tray.cpp
   src/ssh.cpp
+  src/ssh_auth.cpp
+  src/ssh_shell.cpp
+  src/ssh_serial.cpp
   resources/remoted.rc
 )
 
